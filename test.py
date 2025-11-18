@@ -1,141 +1,113 @@
 import os
-import numpy as np
 import cv2
-from aiposematic import scramble, recover
+import numpy as np
+from aiposematic import scramble, recover, SCRAMBLE_MODE
 
-def calculate_entropy(image):
-    """Calculate the entropy of an image."""
-    hist = cv2.calcHist([image], [0], None, [256], [0, 256])
-    hist = hist[hist != 0] / (image.shape[0] * image.shape[1])
-    return -np.sum(hist * np.log2(hist))
-
-def analyze_image_encryption(original_path, locked_path, recovered_path):
-    """Analyze the effectiveness of the image encryption."""
-    # Load images
-    original = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
-    locked = cv2.imread(locked_path, cv2.IMREAD_GRAYSCALE)
-    recovered = cv2.imread(recovered_path, cv2.IMREAD_GRAYSCALE)
-    
-    # 1. Entropy analysis
-    orig_entropy = calculate_entropy(original)
-    locked_entropy = calculate_entropy(locked)
-    
-    # 2. Histogram comparison
-    orig_hist = cv2.calcHist([original], [0], None, [256], [0, 256])
-    locked_hist = cv2.calcHist([locked], [0], None, [256], [0, 256])
-    hist_corr = np.corrcoef(orig_hist.flatten(), locked_hist.flatten())[0, 1]
-    
-    # 3. SSIM (Structural Similarity)
-    ssim_score = ssim(original, locked, data_range=locked.max() - locked.min())
-    
-    # 4. Edge detection comparison
-    edges_orig = cv2.Canny(original, 100, 200)
-    edges_locked = cv2.Canny(locked, 100, 200)
-    edge_similarity = np.sum(edges_orig == edges_locked) / edges_orig.size
-    
-    # 5. Correlation coefficient
-    corr_coeff = np.corrcoef(original.flatten(), locked.flatten())[0, 1]
-    
-    # 6. Pixel difference
-    diff = cv2.absdiff(original, recovered)
-    diff_pixels = np.count_nonzero(diff)
-    total_pixels = original.shape[0] * original.shape[1]
-    
-    print("\n--- Encryption Effectiveness Analysis ---")
-    print(f"Original Entropy: {orig_entropy:.4f} (higher is better, max ~8 for 8-bit grayscale)")
-    print(f"Locked Entropy: {locked_entropy:.4f} (should be close to 8 for good encryption)")
-    print(f"Histogram Correlation: {hist_corr:.6f} (closer to 0 is better)")
-    print(f"SSIM Score: {ssim_score:.6f} (closer to 0 is better)")
-    print(f"Edge Similarity: {edge_similarity:.6f} (closer to 0 is better)")
-    print(f"Correlation Coefficient: {corr_coeff:.6f} (closer to 0 is better)")
-    print(f"Pixels changed in recovery: {diff_pixels}/{total_pixels} (should be 0 for perfect recovery)")
-    
-    return {
-        'original_entropy': orig_entropy,
-        'locked_entropy': locked_entropy,
-        'histogram_correlation': hist_corr,
-        'ssim': ssim_score,
-        'edge_similarity': edge_similarity,
-        'correlation': corr_coeff,
-        'pixels_changed': diff_pixels,
-        'total_pixels': total_pixels
-    }
-
-def make_key(size=(256, 256), filename="key.png"):
-    """Generate a random key image if it doesn't exist."""
-    if not os.path.exists(filename):
-        key = np.random.randint(0, 256, (*size, 3), dtype=np.uint8)
-        cv2.imwrite(filename, key)
-        print(f"Created new key: {filename}")
-    else:
-        key = cv2.imread(filename)
-        print(f"Using existing key: {filename}")
-    return key
-
-def load_image(filename):
-    """Load an image from file, ensuring it's a PNG."""
-    if not filename.lower().endswith('.png'):
-        raise ValueError(f"Only PNG files are supported: {filename}")
+def display_image(window_name, image_path, wait_time=4000):
+    """Display an image in a window and wait for a short time or key press."""
+    img = cv2.imread(image_path)
+    if img is not None:
+        # Create a resizable window
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
         
-    if not os.path.exists(filename):
-        # If the file doesn't exist, try to create a test image if it's the original or key
-        if 'original' in filename.lower():
-            print(f"Creating test image: {filename}")
-            img = np.zeros((512, 512, 3), dtype=np.uint8)
-            cv2.putText(img, 'Test Image', (100, 256), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 5)
-            cv2.imwrite(filename, img)
-        elif 'key' in filename.lower():
-            print(f"Creating random key: {filename}")
-            img = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
-            cv2.imwrite(filename, img)
-        else:
-            raise FileNotFoundError(f"Image not found: {filename}")
+        # Resize if the image is too large for the screen
+        height, width = img.shape[:2]
+        max_size = 800
+        if max(height, width) > max_size:
+            scale = max_size / max(height, width)
+            img = cv2.resize(img, (int(width * scale), int(height * scale)))
+        
+        # Show the image
+        cv2.imshow(window_name, img)
+        print(f"Displaying {window_name} for {wait_time//1000} seconds (press any key to continue)...")
+        
+        # Wait for key press or timeout
+        key = cv2.waitKey(wait_time) & 0xFF
+        if key != 255:  # If any key was pressed
+            cv2.waitKey(0)  # Wait until another key is pressed
+        
+        cv2.destroyWindow(window_name)
+        cv2.waitKey(1)  # Small delay to ensure window is closed
     else:
-        img = cv2.imread(filename, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError(f"Could not read image: {filename}")
+        print(f"Warning: Could not display {image_path}")
+
+def test_scramble_recover(input_image, mode, op_sequence="^"):
+    """Test scrambling and recovering an image with the given mode."""
+    print(f"\n{'='*50}")
+    print(f"Testing with {mode.name} key generation")
+    print(f"{'='*50}")
     
-    print(f"Loaded image: {filename} ({img.shape[1]}x{img.shape[0]})")
-    return img
+    try:
+        # Test scrambling with auto-generated key
+        print(f"\nScrambling with {mode.name} key...")
+        result = scramble(
+            input_image,
+            key_img_path=None,
+            op_string=op_sequence,
+            scramble_mode=mode
+        )
+        
+        scrambled_path = result['scrambled_path']
+        key_path = result['key_path']
+        
+        print(f"Generated key: {key_path}")
+        print(f"Scrambled image saved to: {scrambled_path}")
+        
+        # Display the original, key, and scrambled images
+        display_image("Original Image", input_image)
+        display_image(f"{mode.name} Key", key_path)
+        display_image("Scrambled Image", scrambled_path)
+        
+        # Test recovery with correct key
+        print("\nRecovering with correct key...")
+        recover(scrambled_path, key_path, op_string=op_sequence, output_path="recovered.png")
+        display_image("Recovered Image (Correct Key)", "recovered.png")
+        
+        # Test recovery with wrong key
+        print("\nTesting with wrong key...")
+        wrong_key = cv2.imread(key_path)
+        if wrong_key is not None:
+            wrong_key = 255 - wrong_key  # Invert colors to create wrong key
+            cv2.imwrite("wrong_key.png", wrong_key)
+            
+            try:
+                recover(scrambled_path, "wrong_key.png", op_string=op_sequence, output_path="failed_recovery.png")
+                display_image("Recovered Image (Wrong Key)", "failed_recovery.png")
+                print("WARNING: Recovery succeeded with wrong key! This may indicate a security issue.")
+            except Exception as e:
+                print(f"Expected error with wrong key: {str(e)}")
+        
+    finally:
+        # Clean up
+        for path in [scrambled_path, key_path, 'recovered.png', 'wrong_key.png', 'failed_recovery.png']:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception as e:
+                    print(f"Warning: Could not delete {path}: {e}")
 
-# Input and output filenames (only PNG format)
-input_image = "original.png"
-key_file = "key.png"
-output_locked = "original_locked.png"
-output_recovered = "original_recovered.png"
-output_failed = "original_failed.png"
+def main():
+    # Input image
+    input_image = "original.png"
+    
+    # Check if the image exists
+    if not os.path.exists(input_image):
+        raise FileNotFoundError(
+            f"Test image '{input_image}' not found in the repository. "
+            "Please ensure it exists in the current directory."
+        )
+    
+    print(f"Using test image: {input_image}")
+    img = cv2.imread(input_image)
+    if img is None:
+        raise ValueError(f"Could not read image: {input_image}")
+    print(f"Image dimensions: {img.shape[1]}x{img.shape[0]}")
+    
+    # Test with different modes
+    for mode in [SCRAMBLE_MODE.BUTTERFLY, SCRAMBLE_MODE.QR]:
+        test_scramble_recover(input_image, mode)
+    
+    print("\nAll tests completed!")
 
-# Load the input image and key
-img = load_image(input_image)
-key = load_image(key_file)
-
-# Resize key to match image if needed
-if key.shape != img.shape[:2]:
-    key = cv2.resize(key, (img.shape[1], img.shape[0]))
-    print(f"Resized key to match image dimensions: {img.shape[1]}x{img.shape[0]}")
-
-# Operation sequence for obfuscation
-#op_sequence = "+^>p<a"  # Add, XOR, rotate right, permute, rotate left, add with key
-op_sequence = "^"
-
-print("\nObfuscating image...")
-scramble(input_image, key_file, op_string=op_sequence, output_path=output_locked)
-print(f"Obfuscated image saved as: {output_locked}")
-
-print("\nRecovering image with correct key...")
-recover(output_locked, key_file, op_string=op_sequence, output_path=output_recovered)
-print(f"Recovered image saved as: {output_recovered}")
-
-print("\nTrying with wrong key...")
-# Create a wrong key by shifting and inverting the original key
-wrong_key = np.roll(key, 1, axis=0)
-wrong_key = 255 - wrong_key  # Invert colors for more obvious difference
-wrong_key_path = "wrong_key.png"
-cv2.imwrite(wrong_key_path, wrong_key)
-print(f"Created wrong key: {wrong_key_path}")
-
-recover(output_locked, wrong_key_path, op_string=op_sequence, output_path=output_failed)
-print(f"Failed recovery attempt saved as: {output_failed}")
-
-print("\nProcess completed successfully!")
+if __name__ == "__main__":
+    main()

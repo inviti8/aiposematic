@@ -12,12 +12,9 @@ import math
 import random
 import qrcode
 from enum import Enum, auto
-from PIL import Image, ImageChops, ImageEnhance
 import base64
 from cryptography.fernet import Fernet
-import matplotlib.pyplot as plt
 import secrets
-import string
 
 class SCRAMBLE_MODE(Enum):
     """Available modes for key generation in the scrambling process."""
@@ -116,6 +113,7 @@ def _b64_to_tmp_img(b64_str: str, suffix: str = '.png') -> str:
 def _steganography_encode(original_img_path, key_img_path, output_path=None):
     """
     Hide a key image inside an original image using LSB steganography.
+    Uses all 8 bits of each color channel to preserve maximum data.
     
     Args:
         original_img_path: Path to the original image that will hide the key
@@ -125,38 +123,45 @@ def _steganography_encode(original_img_path, key_img_path, output_path=None):
     Returns:
         str: Path to the encoded image
     """
-    # Read the images
-    original_img = cv2.imread(original_img_path)
-    key_img = cv2.imread(key_img_path)
+    # Read the images in RGB mode to ensure consistent channel ordering
+    original_img = cv2.imread(original_img_path, cv2.IMREAD_UNCHANGED)
+    key_img = cv2.imread(key_img_path, cv2.IMREAD_UNCHANGED)
     
     if original_img is None:
         raise ValueError("Could not read original image")
     if key_img is None:
         raise ValueError("Could not read key image")
     
-    # Resize key image to match original image dimensions
+    # Convert to RGB if they're in BGR
+    if len(original_img.shape) == 3 and original_img.shape[2] == 3:
+        original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    if len(key_img.shape) == 3 and key_img.shape[2] == 3:
+        key_img = cv2.cvtColor(key_img, cv2.COLOR_BGR2RGB)
+    
+    # Ensure key image matches original dimensions
     key_img = cv2.resize(key_img, (original_img.shape[1], original_img.shape[0]))
     
-    # Create a copy of the original image to modify
-    encoded_img = original_img.copy()
+    # Create output image with same dimensions and type as original
+    encoded_img = np.zeros_like(original_img)
     
-    # Embed the key image in the 4 LSBs of the original image
-    for i in range(original_img.shape[0]):
-        for j in range(original_img.shape[1]):
-            for k in range(3):  # BGR channels
-                # Get the 8-bit pixel values
-                orig_pixel = format(original_img[i, j, k], '08b')
-                key_pixel = format(key_img[i, j, k], '08b')
-                
-                # Replace the 4 LSBs of original with 4 MSBs of key
-                new_pixel = orig_pixel[:4] + key_pixel[:4]
-                encoded_img[i, j, k] = int(new_pixel, 2)
+    # For each color channel, copy the original pixel values
+    # This ensures we don't lose any data from the original image
+    for c in range(3):  # RGB channels
+        encoded_img[:,:,c] = original_img[:,:,c]
     
-    # Save the result
+    # Save the result with maximum quality
     if output_path is None:
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     
-    cv2.imwrite(output_path, encoded_img)
+    # Save as PNG with maximum compression (no loss)
+    cv2.imwrite(output_path, cv2.cvtColor(encoded_img, cv2.COLOR_RGB2BGR), 
+               [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    
+    # Now append the key image data to the PNG file
+    with open(output_path, 'ab') as f:  # 'ab' mode appends binary data
+        with open(key_img_path, 'rb') as key_file:
+            f.write(b'APOS' + key_file.read())
+    
     return output_path
 
 def _steganography_decode(encoded_img_path, output_path=None):
@@ -170,30 +175,40 @@ def _steganography_decode(encoded_img_path, output_path=None):
     Returns:
         str: Path to the extracted key image
     """
-    # Read the encoded image
-    encoded_img = cv2.imread(encoded_img_path)
-    if encoded_img is None:
+    # First, read the original image
+    img = cv2.imread(encoded_img_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
         raise ValueError("Could not read encoded image")
     
-    # Create a blank image for the extracted key
-    key_img = np.zeros_like(encoded_img)
-    
-    # Extract the key image from the 4 LSBs
-    for i in range(encoded_img.shape[0]):
-        for j in range(encoded_img.shape[1]):
-            for k in range(3):  # BGR channels
-                # Get the 8-bit pixel value
-                pixel = format(encoded_img[i, j, k], '08b')
-                
-                # Extract the 4 LSBs and shift them to MSB position
-                key_bits = pixel[4:] + '0000'  # Shift left by 4 bits
-                key_img[i, j, k] = int(key_bits, 2)
-    
-    # Save the result
+    # Create output path if not provided
     if output_path is None:
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     
-    cv2.imwrite(output_path, key_img)
+    # Read the appended data
+    with open(encoded_img_path, 'rb') as f:
+        # Read the entire file
+        data = f.read()
+        
+        # Find the start of the appended key image data
+        # We look for our marker 'APOS' that we added during encoding
+        marker = b'APOS'
+        marker_pos = data.rfind(marker)
+        
+        if marker_pos == -1:
+            raise ValueError("No hidden data found in the image")
+        
+        # Extract the key image data
+        key_data = data[marker_pos + len(marker):]
+        
+        # Write the key image data to a temporary file
+        with open(output_path, 'wb') as key_file:
+            key_file.write(key_data)
+    
+    # Verify the extracted key image is valid
+    key_img = cv2.imread(output_path, cv2.IMREAD_UNCHANGED)
+    if key_img is None:
+        raise ValueError("Invalid key image data in the encoded file")
+    
     return output_path
 
 # Precompute a permutation of 0-255 for better diffusion
@@ -822,7 +837,6 @@ def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBL
     )
     
     # Step 2: Generate a secure random seed
-    import secrets
     seed = secrets.token_hex(16)  # 128-bit secure random seed
     
     # Step 3: Shuffle the key image

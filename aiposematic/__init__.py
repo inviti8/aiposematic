@@ -13,6 +13,11 @@ import random
 import qrcode
 from enum import Enum, auto
 from PIL import Image, ImageChops, ImageEnhance
+import base64
+from cryptography.fernet import Fernet
+import matplotlib.pyplot as plt
+import secrets
+import string
 
 class SCRAMBLE_MODE(Enum):
     """Available modes for key generation in the scrambling process."""
@@ -23,6 +28,173 @@ class SCRAMBLE_MODE(Enum):
 # ------------------------------------------------------------------
 # Aiposematic: Scramble & Recover using image key + operation string
 # ------------------------------------------------------------------
+
+def _encrypt_b64_as_string(img_path: str, key: str = None) -> tuple:
+    """
+    Load an image, convert it to base64, and encrypt it.
+    
+    Args:
+        img_path: Path to the image file
+        key: Optional encryption key (32-byte URL-safe base64-encoded bytes).
+             If None, a new key will be generated.
+             
+    Returns:
+        tuple: (encrypted_base64_string, key_used)
+    """
+    # Read the image file as binary data
+    with open(img_path, 'rb') as img_file:
+        img_data = img_file.read()
+    
+    # Convert binary data to base64 string
+    b64_string = base64.b64encode(img_data).decode('utf-8')
+    
+    # Generate a key if none provided
+    if key is None:
+        key = Fernet.generate_key()
+    elif not isinstance(key, bytes):
+        key = key.encode('utf-8')
+    
+    # Encrypt the base64 string
+    f = Fernet(key)
+    encrypted = f.encrypt(b64_string.encode('utf-8'))
+    
+    return encrypted.decode('utf-8'), key.decode('utf-8')
+
+def _decrypt_b64_image(encrypted_data: str, key: str) -> bytes:
+    """
+    Decrypt an encrypted base64 image string back to binary data.
+    
+    Args:
+        encrypted_data: The encrypted base64 string
+        key: The encryption key used
+        
+    Returns:
+        bytes: The original image binary data
+    """
+    if not isinstance(key, bytes):
+        key = key.encode('utf-8')
+    
+    f = Fernet(key)
+    try:
+        # First decode the base64 string
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        # Then decrypt the bytes
+        decrypted = f.decrypt(encrypted_bytes)
+        return decrypted
+    except Exception as e:
+        print(f"Decryption error: {str(e)}")
+        print(f"Key length: {len(key) if key else 0} bytes")
+        print(f"Encrypted data length: {len(encrypted_data) if encrypted_data else 0} chars")
+        raise
+
+
+def _b64_to_tmp_img(b64_str: str, suffix: str = '.png') -> str:
+    """
+    Convert a base64 encoded image string to a temporary image file.
+    
+    Args:
+        b64_str: Base64 encoded image string
+        suffix: File extension for the temporary file (default: '.png')
+        
+    Returns:
+        str: Path to the temporary image file
+    """
+    
+    # Decode the base64 string to binary data
+    try:
+        img_data = base64.b64decode(b64_str)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 string: {str(e)}")
+    
+    # Create a temporary file with the specified suffix
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+        temp_file.write(img_data)
+        temp_path = temp_file.name
+    
+    return temp_path
+
+def _steganography_encode(original_img_path, key_img_path, output_path=None):
+    """
+    Hide a key image inside an original image using LSB steganography.
+    
+    Args:
+        original_img_path: Path to the original image that will hide the key
+        key_img_path: Path to the key image to hide
+        output_path: Optional output path for the encoded image
+        
+    Returns:
+        str: Path to the encoded image
+    """
+    # Read the images
+    original_img = cv2.imread(original_img_path)
+    key_img = cv2.imread(key_img_path)
+    
+    if original_img is None:
+        raise ValueError("Could not read original image")
+    if key_img is None:
+        raise ValueError("Could not read key image")
+    
+    # Resize key image to match original image dimensions
+    key_img = cv2.resize(key_img, (original_img.shape[1], original_img.shape[0]))
+    
+    # Create a copy of the original image to modify
+    encoded_img = original_img.copy()
+    
+    # Embed the key image in the 4 LSBs of the original image
+    for i in range(original_img.shape[0]):
+        for j in range(original_img.shape[1]):
+            for k in range(3):  # BGR channels
+                # Get the 8-bit pixel values
+                orig_pixel = format(original_img[i, j, k], '08b')
+                key_pixel = format(key_img[i, j, k], '08b')
+                
+                # Replace the 4 LSBs of original with 4 MSBs of key
+                new_pixel = orig_pixel[:4] + key_pixel[:4]
+                encoded_img[i, j, k] = int(new_pixel, 2)
+    
+    # Save the result
+    if output_path is None:
+        output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+    
+    cv2.imwrite(output_path, encoded_img)
+    return output_path
+
+def _steganography_decode(encoded_img_path, output_path=None):
+    """
+    Extract the hidden key image from an encoded image.
+    
+    Args:
+        encoded_img_path: Path to the image with hidden data
+        output_path: Optional output path for the extracted key image
+        
+    Returns:
+        str: Path to the extracted key image
+    """
+    # Read the encoded image
+    encoded_img = cv2.imread(encoded_img_path)
+    if encoded_img is None:
+        raise ValueError("Could not read encoded image")
+    
+    # Create a blank image for the extracted key
+    key_img = np.zeros_like(encoded_img)
+    
+    # Extract the key image from the 4 LSBs
+    for i in range(encoded_img.shape[0]):
+        for j in range(encoded_img.shape[1]):
+            for k in range(3):  # BGR channels
+                # Get the 8-bit pixel value
+                pixel = format(encoded_img[i, j, k], '08b')
+                
+                # Extract the 4 LSBs and shift them to MSB position
+                key_bits = pixel[4:] + '0000'  # Shift left by 4 bits
+                key_img[i, j, k] = int(key_bits, 2)
+    
+    # Save the result
+    if output_path is None:
+        output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+    
+    cv2.imwrite(output_path, key_img)
+    return output_path
 
 # Precompute a permutation of 0-255 for better diffusion
 _permutation = np.random.permutation(256).astype(np.uint8)
@@ -252,7 +424,6 @@ def _generate_butterfly_key(width=256, height=None, canvas_size=256, output_path
     
     # Use a temporary file if no output path is provided
     if output_path is None:
-        import tempfile
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     
     # Generate the image with the specified dimensions
@@ -550,3 +721,164 @@ def recover(locked_img_path, key_img_path, op_string="+^>p<+^>p<+^>p<", output_p
     cv2.imwrite(output_path, recovered)
     print(f"Recovered image saved: {output_path}")
     return output_path
+
+def get_seeded_random(seed):
+    """Create a deterministic random number generator from a seed."""
+    import hashlib
+    # Use a hash of the seed to ensure good distribution
+    if isinstance(seed, str):
+        seed = seed.encode('utf-8')
+    if not isinstance(seed, bytes):
+        seed = str(seed).encode('utf-8')
+    seed_hash = int(hashlib.sha256(seed).hexdigest(), 16)
+    import random
+    random.seed(seed_hash)
+    return random
+
+def shuffle_image_pixels(image_path, seed, output_path=None):
+    """Shuffle the pixels of an image using a seed."""
+    from PIL import Image
+    import numpy as np
+    
+    # Open the image
+    img = Image.open(image_path)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    # Convert to numpy array
+    arr = np.array(img)
+    height, width = arr.shape[:2]
+    total_pixels = height * width
+    
+    # Flatten the array
+    flat = arr.reshape(-1, 3)
+    
+    # Generate deterministic shuffle indices
+    rng = get_seeded_random(seed)
+    indices = np.arange(total_pixels)
+    rng.shuffle(indices)
+    
+    # Apply the shuffle
+    shuffled = flat[indices]
+    
+    # Reshape back to original dimensions
+    result = shuffled.reshape(height, width, 3)
+    
+    # Save or return the result
+    if output_path:
+        result_img = Image.fromarray(result)
+        result_img.save(output_path)
+        return output_path
+    return Image.fromarray(result)
+
+def unshuffle_image_pixels(shuffled_img_path, seed, output_path=None):
+    """Unshuffle an image that was shuffled with shuffle_image_pixels."""
+    from PIL import Image
+    import numpy as np
+    
+    # Open the image
+    img = Image.open(shuffled_img_path)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    # Convert to numpy array
+    arr = np.array(img)
+    height, width = arr.shape[:2]
+    total_pixels = height * width
+    
+    # Flatten the array
+    flat = arr.reshape(-1, 3)
+    
+    # Generate the same shuffle indices
+    rng = get_seeded_random(seed)
+    indices = np.arange(total_pixels)
+    rng.shuffle(indices)
+    
+    # Create inverse mapping
+    inverse_indices = np.argsort(indices)
+    
+    # Apply inverse shuffle
+    unshuffled = flat[inverse_indices]
+    
+    # Reshape and save/return
+    result = unshuffled.reshape(height, width, 3)
+    if output_path:
+        result_img = Image.fromarray(result)
+        result_img.save(output_path)
+        return output_path
+    return Image.fromarray(result)
+
+def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
+    """
+    Create a new aposematic image using pixel shuffling encryption.
+    """
+    # Step 1: Scramble the original image
+    result = scramble(
+        original_img_path=original_img_path,
+        key_img_path=None,  # Generate a new key
+        op_string=op_string,
+        scramble_mode=scramble_mode,
+        output_path=None  # Will generate a temp path
+    )
+    
+    # Step 2: Generate a secure random seed
+    import secrets
+    seed = secrets.token_hex(16)  # 128-bit secure random seed
+    
+    # Step 3: Shuffle the key image
+    shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+    shuffle_image_pixels(result['key_path'], seed, shuffled_key_path)
+    
+    # Step 4: Hide the shuffled key in the scrambled image
+    final_image_path = output_path or tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+    _steganography_encode(result['scrambled_path'], shuffled_key_path, final_image_path)
+    
+    # Clean up temporary files
+    for path in [result['scrambled_path'], result['key_path'], shuffled_key_path]:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception as e:
+            print(f"Warning: Could not delete temporary file {path}: {e}")
+    
+    return {
+        'img_path': final_image_path,
+        'cipher_key': seed  # Return the seed as the encryption key
+    }
+
+def recover_aposematic_img(aposematic_img_path, cipher_key, op_string='-^+', output_path=None):
+    """
+    Recover the original image from an aposematic image using pixel unshuffling.
+    """
+    try:
+        # Step 1: Extract the shuffled key image
+        shuffled_key_path = _steganography_decode(aposematic_img_path)
+        
+        try:
+            # Step 2: Unshuffle the key image
+            unshuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+            unshuffle_image_pixels(shuffled_key_path, cipher_key, unshuffled_key_path)
+            
+            try:
+                # Step 3: Recover the original image
+                recovered_path = recover(
+                    locked_img_path=aposematic_img_path,
+                    key_img_path=unshuffled_key_path,
+                    op_string=op_string,
+                    output_path=output_path
+                )
+                return recovered_path
+            finally:
+                # Clean up the unshuffled key
+                if os.path.exists(unshuffled_key_path):
+                    os.unlink(unshuffled_key_path)
+        finally:
+            # Clean up the extracted key
+            if os.path.exists(shuffled_key_path):
+                os.unlink(shuffled_key_path)
+                
+    except Exception as e:
+        print(f"Error recovering aposematic image: {str(e)}")
+        raise
+
+        

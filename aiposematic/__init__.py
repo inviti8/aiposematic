@@ -823,18 +823,58 @@ def unshuffle_image_pixels(shuffled_img_path, seed, output_path=None):
         return output_path
     return Image.fromarray(result)
 
+def add_ai_deterrent_features(image_path, output_path):
+    """
+    Add AI-deterrent features to an image.
+    This includes high-frequency noise and edge-based modifications.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not load image: {image_path}")
+    
+    # 1. Add high-frequency noise (barely visible to humans)
+    noise = np.random.normal(0, 3, img.shape).astype(np.uint8)
+    img = cv2.addWeighted(img, 0.95, noise, 0.05, 0)
+    
+    # 2. Add subtle adversarial patterns in edge regions
+    edges = cv2.Canny(img, 100, 200)
+    kernel = np.ones((3,3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    img[edges > 0] = cv2.addWeighted(img[edges > 0], 0.9, 
+                                    np.random.randint(0, 50, img[edges > 0].shape, np.uint8), 
+                                    0.1, 0)
+    
+    cv2.imwrite(output_path, img)
+    return output_path
+
 def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
     """
     Create a new aposematic image using pixel shuffling encryption.
     """
-    # Step 1: Scramble the original image
-    result = scramble(
-        original_img_path=original_img_path,
-        key_img_path=None,  # Generate a new key
-        op_string=op_string,
-        scramble_mode=scramble_mode,
-        output_path=None  # Will generate a temp path
-    )
+    # Create a temporary file for the AI-deterred image
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    try:
+        # Step 0: Apply AI deterrent features to the original image
+        deterred_path = add_ai_deterrent_features(original_img_path, temp_path)
+        
+        # Step 1: Scramble the original image with AI deterrents
+        result = scramble(
+            original_img_path=deterred_path,
+            key_img_path=None,  # Generate a new key
+            op_string=op_string,
+            scramble_mode=scramble_mode,
+            output_path=None  # Will generate a temp path
+        )
+    except Exception as e:
+        # Clean up the temporary file if it exists
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+        raise  # Re-raise the exception
     
     # Step 2: Generate a secure random seed
     seed = secrets.token_hex(16)  # 128-bit secure random seed
@@ -848,7 +888,8 @@ def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBL
     _steganography_encode(result['scrambled_path'], shuffled_key_path, final_image_path)
     
     # Clean up temporary files
-    for path in [result['scrambled_path'], result['key_path'], shuffled_key_path]:
+    temp_files = [result['scrambled_path'], result['key_path'], shuffled_key_path, temp_path]
+    for path in temp_files:
         try:
             if os.path.exists(path):
                 os.unlink(path)

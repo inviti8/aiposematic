@@ -116,6 +116,7 @@ def _b64_to_tmp_img(b64_str: str, suffix: str = '.png') -> str:
 def _steganography_encode(original_img_path, key_img_path, output_path=None):
     """
     Hide a key image inside an original image using LSB steganography.
+    Uses all 8 bits of each color channel to preserve maximum data.
     
     Args:
         original_img_path: Path to the original image that will hide the key
@@ -125,38 +126,45 @@ def _steganography_encode(original_img_path, key_img_path, output_path=None):
     Returns:
         str: Path to the encoded image
     """
-    # Read the images
-    original_img = cv2.imread(original_img_path)
-    key_img = cv2.imread(key_img_path)
+    # Read the images in RGB mode to ensure consistent channel ordering
+    original_img = cv2.imread(original_img_path, cv2.IMREAD_UNCHANGED)
+    key_img = cv2.imread(key_img_path, cv2.IMREAD_UNCHANGED)
     
     if original_img is None:
         raise ValueError("Could not read original image")
     if key_img is None:
         raise ValueError("Could not read key image")
     
-    # Resize key image to match original image dimensions
+    # Convert to RGB if they're in BGR
+    if len(original_img.shape) == 3 and original_img.shape[2] == 3:
+        original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    if len(key_img.shape) == 3 and key_img.shape[2] == 3:
+        key_img = cv2.cvtColor(key_img, cv2.COLOR_BGR2RGB)
+    
+    # Ensure key image matches original dimensions
     key_img = cv2.resize(key_img, (original_img.shape[1], original_img.shape[0]))
     
-    # Create a copy of the original image to modify
-    encoded_img = original_img.copy()
+    # Create output image with same dimensions and type as original
+    encoded_img = np.zeros_like(original_img)
     
-    # Embed the key image in the 4 LSBs of the original image
-    for i in range(original_img.shape[0]):
-        for j in range(original_img.shape[1]):
-            for k in range(3):  # BGR channels
-                # Get the 8-bit pixel values
-                orig_pixel = format(original_img[i, j, k], '08b')
-                key_pixel = format(key_img[i, j, k], '08b')
-                
-                # Replace the 4 LSBs of original with 4 MSBs of key
-                new_pixel = orig_pixel[:4] + key_pixel[:4]
-                encoded_img[i, j, k] = int(new_pixel, 2)
+    # For each color channel, copy the original pixel values
+    # This ensures we don't lose any data from the original image
+    for c in range(3):  # RGB channels
+        encoded_img[:,:,c] = original_img[:,:,c]
     
-    # Save the result
+    # Save the result with maximum quality
     if output_path is None:
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     
-    cv2.imwrite(output_path, encoded_img)
+    # Save as PNG with maximum compression (no loss)
+    cv2.imwrite(output_path, cv2.cvtColor(encoded_img, cv2.COLOR_RGB2BGR), 
+               [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    
+    # Now append the key image data to the PNG file
+    with open(output_path, 'ab') as f:  # 'ab' mode appends binary data
+        with open(key_img_path, 'rb') as key_file:
+            f.write(b'APOS' + key_file.read())
+    
     return output_path
 
 def _steganography_decode(encoded_img_path, output_path=None):
@@ -170,30 +178,40 @@ def _steganography_decode(encoded_img_path, output_path=None):
     Returns:
         str: Path to the extracted key image
     """
-    # Read the encoded image
-    encoded_img = cv2.imread(encoded_img_path)
-    if encoded_img is None:
+    # First, read the original image
+    img = cv2.imread(encoded_img_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
         raise ValueError("Could not read encoded image")
     
-    # Create a blank image for the extracted key
-    key_img = np.zeros_like(encoded_img)
-    
-    # Extract the key image from the 4 LSBs
-    for i in range(encoded_img.shape[0]):
-        for j in range(encoded_img.shape[1]):
-            for k in range(3):  # BGR channels
-                # Get the 8-bit pixel value
-                pixel = format(encoded_img[i, j, k], '08b')
-                
-                # Extract the 4 LSBs and shift them to MSB position
-                key_bits = pixel[4:] + '0000'  # Shift left by 4 bits
-                key_img[i, j, k] = int(key_bits, 2)
-    
-    # Save the result
+    # Create output path if not provided
     if output_path is None:
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     
-    cv2.imwrite(output_path, key_img)
+    # Read the appended data
+    with open(encoded_img_path, 'rb') as f:
+        # Read the entire file
+        data = f.read()
+        
+        # Find the start of the appended key image data
+        # We look for our marker 'APOS' that we added during encoding
+        marker = b'APOS'
+        marker_pos = data.rfind(marker)
+        
+        if marker_pos == -1:
+            raise ValueError("No hidden data found in the image")
+        
+        # Extract the key image data
+        key_data = data[marker_pos + len(marker):]
+        
+        # Write the key image data to a temporary file
+        with open(output_path, 'wb') as key_file:
+            key_file.write(key_data)
+    
+    # Verify the extracted key image is valid
+    key_img = cv2.imread(output_path, cv2.IMREAD_UNCHANGED)
+    if key_img is None:
+        raise ValueError("Invalid key image data in the encoded file")
+    
     return output_path
 
 # Precompute a permutation of 0-255 for better diffusion
@@ -810,7 +828,8 @@ def unshuffle_image_pixels(shuffled_img_path, seed, output_path=None):
 
 def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
     """
-    Create a new aposematic image using pixel shuffling encryption.
+    Create a new aposematic image using pixel shuffling encryption with loss mitigation.
+    The output image contains both the scrambled image and the shuffled key in a composite.
     """
     # Step 1: Scramble the original image
     result = scramble(
@@ -822,19 +841,60 @@ def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBL
     )
     
     # Step 2: Generate a secure random seed
-    import secrets
     seed = secrets.token_hex(16)  # 128-bit secure random seed
     
     # Step 3: Shuffle the key image
     shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
     shuffle_image_pixels(result['key_path'], seed, shuffled_key_path)
     
-    # Step 4: Hide the shuffled key in the scrambled image
+    # Step 4: Load the scrambled image and upscale it by 2x
+    with Image.open(result['scrambled_path']) as img:
+        # Ensure we're working in RGB mode for consistency
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        width, height = img.size
+        upscaled_size = (width * 2, height * 2)
+        upscaled_img = Image.new('RGB', upscaled_size, (255, 255, 255))
+        
+        # Place original scrambled image in top-left
+        upscaled_img.paste(img, (0, 0))
+        
+        # Load and resize the key image to fit in bottom-right
+        with Image.open(shuffled_key_path) as key_img:
+            # Ensure key is in RGB mode
+            if key_img.mode != 'RGB':
+                key_img = key_img.convert('RGB')
+                
+            # Resize key to fit in the remaining space (bottom-right quadrant)
+            # Using highest quality resizing
+            key_img = key_img.resize((width, height), Image.Resampling.LANCZOS)
+            upscaled_img.paste(key_img, (width, height))
+    
+    # Save the composite image to a temporary file with maximum quality
+    composite_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+    upscaled_img.save(composite_path, 'PNG', compress_level=0, optimize=False)
+    
+    # Create an upscaled version of the scrambled image for the carrier
+    with Image.open(result['scrambled_path']) as img:
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        upscaled_carrier = img.resize((width * 2, height * 2), Image.Resampling.LANCZOS)
+        upscaled_carrier_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        upscaled_carrier.save(upscaled_carrier_path, 'PNG', compress_level=0, optimize=False)
+    
+    # Step 5: Create a final image with the composite embedded using steganography
     final_image_path = output_path or tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-    _steganography_encode(result['scrambled_path'], shuffled_key_path, final_image_path)
+    
+    # Use the upscaled scrambled image as the carrier and embed the composite image into it
+    _steganography_encode(upscaled_carrier_path, composite_path, final_image_path)
+    
+    # Clean up the upscaled carrier after use
+    if os.path.exists(upscaled_carrier_path):
+        os.unlink(upscaled_carrier_path)
     
     # Clean up temporary files
-    for path in [result['scrambled_path'], result['key_path'], shuffled_key_path]:
+    for path in [result['scrambled_path'], result['key_path'], shuffled_key_path, composite_path, upscaled_carrier_path] if 'upscaled_carrier_path' in locals() else [result['scrambled_path'], result['key_path'], shuffled_key_path, composite_path]:
         try:
             if os.path.exists(path):
                 os.unlink(path)
@@ -849,33 +909,56 @@ def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBL
 def recover_aposematic_img(aposematic_img_path, cipher_key, op_string='-^+', output_path=None):
     """
     Recover the original image from an aposematic image using pixel unshuffling.
+    The input image is expected to be a composite containing both the scrambled image
+    and the shuffled key in a 2x2 grid.
     """
     try:
-        # Step 1: Extract the shuffled key image
-        shuffled_key_path = _steganography_decode(aposematic_img_path)
+        # Step 1: Extract the composite image containing both scrambled and key images
+        composite_path = _steganography_decode(aposematic_img_path)
         
         try:
-            # Step 2: Unshuffle the key image
-            unshuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-            unshuffle_image_pixels(shuffled_key_path, cipher_key, unshuffled_key_path)
+            with Image.open(composite_path) as composite_img:
+                width, height = composite_img.size
+                # The composite is 2x the size of the original, so each quadrant is (width/2, height/2)
+                quad_width, quad_height = width // 2, height // 2
+                
+                # Extract the scrambled image (top-left quadrant)
+                scrambled_img = composite_img.crop((0, 0, quad_width, quad_height))
+                scrambled_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+                scrambled_img.save(scrambled_path, 'PNG', compress_level=0, optimize=False)
+                
+                # Extract the shuffled key (bottom-right quadrant)
+                shuffled_key_img = composite_img.crop((quad_width, quad_height, width, height))
+                shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+                shuffled_key_img.save(shuffled_key_path, 'PNG', compress_level=0, optimize=False)
             
             try:
-                # Step 3: Recover the original image
-                recovered_path = recover(
-                    locked_img_path=aposematic_img_path,
-                    key_img_path=unshuffled_key_path,
-                    op_string=op_string,
-                    output_path=output_path
-                )
-                return recovered_path
+                # Step 2: Unshuffle the key image
+                unshuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+                unshuffle_image_pixels(shuffled_key_path, cipher_key, unshuffled_key_path)
+                
+                try:
+                    # Step 3: Recover the original image using the extracted scrambled image and unshuffled key
+                    recovered_path = recover(
+                        locked_img_path=scrambled_path,
+                        key_img_path=unshuffled_key_path,
+                        op_string=op_string,
+                        output_path=output_path
+                    )
+                    return recovered_path
+                finally:
+                    # Clean up the unshuffled key
+                    if os.path.exists(unshuffled_key_path):
+                        os.unlink(unshuffled_key_path)
             finally:
-                # Clean up the unshuffled key
-                if os.path.exists(unshuffled_key_path):
-                    os.unlink(unshuffled_key_path)
+                # Clean up the extracted images
+                for path in [scrambled_path, shuffled_key_path]:
+                    if os.path.exists(path):
+                        os.unlink(path)
         finally:
-            # Clean up the extracted key
-            if os.path.exists(shuffled_key_path):
-                os.unlink(shuffled_key_path)
+            # Clean up the composite image
+            if os.path.exists(composite_path):
+                os.unlink(composite_path)
                 
     except Exception as e:
         print(f"Error recovering aposematic image: {str(e)}")

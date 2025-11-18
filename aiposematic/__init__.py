@@ -293,27 +293,13 @@ def _generate_qr_positions(n=5, size_range=(0.1, 0.3), canvas_size=1000, min_pad
     return qr_positions
 
 def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_size=256, output_path=None):
-    """Generate a QR key image with the specified dimensions."""
+    """Generate a QR key image with multiple scattered QR codes on a noise background."""
     from PIL import Image, ImageEnhance, ImageOps
     import numpy as np
     
     if height is None:
         height = width  # Default to square image if height not specified
         
-    # Generate the QR code
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    
-    # Create the QR code with green modules and magenta background (to be keyed out)
-    qr_img = qr.make_image(fill_color=_random_rgb_int(), back_color="magenta")
-    qr_img = qr_img.convert('RGBA')
-    
     # Create a noise background using matplotlib
     dpi = 100
     fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi, frameon=False)
@@ -341,36 +327,60 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
     plt.close(fig)
     
     # Convert numpy array to PIL Image
-    background = Image.fromarray(img_data).convert('RGB')
-    
-    # Resize QR code to match background
-    qr_img = qr_img.resize(background.size, Image.Resampling.LANCZOS)
-    
-    # Convert QR code to RGBA if not already
-    if qr_img.mode != 'RGBA':
-        qr_img = qr_img.convert('RGBA')
-    
-    # Create a mask from the magenta background!!
-    data = qr_img.getdata()
-    new_data = []
-    for item in data:
-        # Change all magenta (or near-magenta) pixels to be transparent
-        if item[0] > 200 and item[1] < 50 and item[2] > 200:  # Magenta threshold
-            new_data.append((255, 0, 0, 0))  # Transparent
-        else:
-            new_data.append(item)  # Keep original color
-    
-    # Update image data
-    qr_img.putdata(new_data)
-    
-    # Create a new image with the same size as background
+    background = Image.fromarray(img_data).convert('RGBA')
     result = Image.new('RGBA', background.size)
-    
-    # Paste the background
     result.paste(background, (0, 0))
     
-    # Paste the QR code on top using the alpha channel
-    result.paste(qr_img, (0, 0), qr_img)
+    # Generate multiple QR codes at random positions
+    qr_positions = _generate_qr_positions(
+        n=random.randint(6, 10),  # Number of QR codes
+        size_range=(0.1, 0.4),   # Size range as fraction of canvas
+        canvas_size=canvas_size
+    )
+    
+    for x, y, size in qr_positions:
+        # Generate a unique data string for each QR code
+        qr_data = f"{data}_{random.getrandbits(32):x}"
+        
+        # Generate the QR code
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,  # Lower error correction for smaller codes
+            box_size=1,  # Smaller box size for more detail
+            border=1,    # Smaller border
+        )
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        
+        # Create the QR code with random color and magenta background
+        qr_color = _random_rgb_int()
+        qr_img = qr.make_image(fill_color=qr_color, back_color="magenta")
+        qr_img = qr_img.convert('RGBA')
+        
+        # Make magenta transparent
+        data = qr_img.getdata()
+        new_data = []
+        for item in data:
+            # Change all magenta (or near-magenta) pixels to be transparent
+            if item[0] > 200 and item[1] < 50 and item[2] > 200:  # Magenta threshold
+                new_data.append((0, 0, 0, 0))  # Transparent
+            else:
+                new_data.append(item)  # Keep original color
+        
+        qr_img.putdata(new_data)
+        
+        # Calculate position and size
+        qr_size = (size, size)
+        position = (int(x), int(y))
+        
+        # Create a new image for the QR code at the correct size
+        qr_img = qr_img.resize(qr_size, Image.Resampling.LANCZOS)
+        
+        # Paste the QR code onto the result
+        result.paste(qr_img, position, qr_img)
+    
+    # Convert to RGB for saving
+    result = result.convert('RGB')
     
     # Save the result
     if output_path is None:

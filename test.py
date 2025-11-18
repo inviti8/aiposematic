@@ -31,7 +31,7 @@ def display_image(window_name, image_path, wait_time=4000):
     else:
         print(f"Warning: Could not display {image_path}")
 
-def test_scramble_recover(input_image, mode, op_sequence="^"):
+def test_scramble_recover(input_image, mode, op_sequence="-^+"):
     """Test scrambling and recovering an image with the given mode."""
     print(f"\n{'='*50}")
     print(f"Testing with {mode.name} key generation")

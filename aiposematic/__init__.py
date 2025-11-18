@@ -482,6 +482,8 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
     """Generate a QR key image with multiple scattered QR codes on a noise background."""
     from PIL import Image, ImageEnhance, ImageOps
     import numpy as np
+    from qrcode.image.styledpil import StyledPilImage
+    from qrcode.image.styles.moduledrawers import RoundedModuleDrawer
     
     if height is None:
         height = width  # Default to square image if height not specified
@@ -524,23 +526,33 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
         canvas_size=canvas_size
     )
     
+    # Generate a higher resolution version of the background
+    scale_factor = 4  # Scale up for better QR code quality
+    large_canvas = background.copy().resize((canvas_size * scale_factor, canvas_size * scale_factor), 
+                                          Image.Resampling.NEAREST)
+    
     for x, y, size in qr_positions:
         # Generate a unique data string for each QR code
         qr_data = f"{data}_{random.getrandbits(32):x}"
         
-        # Generate the QR code
+        # Generate the QR code at a higher resolution
         qr = qrcode.QRCode(
             version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,  # Lower error correction for smaller codes
-            box_size=1,  # Smaller box size for more detail
-            border=1,    # Smaller border
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=4,  # Increased box size for better quality
+            border=1,    # Original border size
         )
         qr.add_data(qr_data)
         qr.make(fit=True)
         
         # Create the QR code with random color and magenta background
         qr_color = _random_rgb_int()
-        qr_img = qr.make_image(fill_color=qr_color, back_color="magenta")
+        
+        # Create a temporary image with magenta background
+        qr_img = qr.make_image(
+            fill_color=qr_color,
+            back_color="magenta"
+        )
         qr_img = qr_img.convert('RGBA')
         
         # Make magenta transparent
@@ -555,18 +567,26 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
         
         qr_img.putdata(new_data)
         
-        # Calculate position and size
-        qr_size = (size, size)
-        position = (int(x), int(y))
+        # Calculate position and size at high resolution
+        x_hr, y_hr = int(x * scale_factor), int(y * scale_factor)
+        size_hr = int(size * scale_factor)
         
-        # Create a new image for the QR code at the correct size
-        qr_img = qr_img.resize(qr_size, Image.Resampling.LANCZOS)
+        # Resize using NEAREST to maintain sharp edges
+        qr_img = qr_img.resize((size_hr, size_hr), Image.Resampling.NEAREST)
         
-        # Paste the QR code onto the result
-        result.paste(qr_img, position, qr_img)
+        # Create a new image to handle transparency correctly
+        qr_final = Image.new('RGBA', large_canvas.size, (0, 0, 0, 0))
+        qr_final.paste(qr_img, (x_hr, y_hr))
+        
+        # Composite onto the high-res canvas
+        large_canvas = Image.alpha_composite(
+            large_canvas.convert('RGBA'),
+            qr_final
+        )
     
-    # Convert to RGB for saving
-    result = result.convert('RGB')
+    # Convert back to RGB and scale down
+    result = large_canvas.convert('RGB')
+    result = result.resize((canvas_size, canvas_size), Image.Resampling.LANCZOS)
     
     # Save the result
     if output_path is None:
@@ -615,7 +635,7 @@ INV_OPS = {
     'A': 'a',   # Subtract constant → add constant
 }
 
-def scramble(original_img_path, key_img_path=None, op_string="+^>p<+^>p<+^>p<", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
+def scramble(original_img_path, key_img_path=None, op_string="^", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
     """
     Scramble original using key image and repeating op_string.
     

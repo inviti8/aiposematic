@@ -1,3 +1,6 @@
+"""Aiposematic: Scramble & Recover using image key + operation string , By: Fibo Metavinci"""
+
+__version__ = "0.01"
 import os
 import numpy as np
 import cv2
@@ -635,7 +638,7 @@ INV_OPS = {
     'A': 'a',   # Subtract constant → add constant
 }
 
-def scramble(original_img_path, key_img_path=None, op_string="^", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
+def scramble(original_img_path, key_img_path=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
     """
     Scramble original using key image and repeating op_string.
     
@@ -712,7 +715,7 @@ def scramble(original_img_path, key_img_path=None, op_string="^", scramble_mode=
         'key_path': key_path
     }
 
-def recover(locked_img_path, key_img_path, op_string="+^>p<+^>p<+^>p<", output_path=None):
+def recover(locked_img_path, key_img_path, op_string="-^+", output_path=None):
     """
     Recover original using same key and op_string.
     """

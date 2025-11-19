@@ -11,12 +11,12 @@ AIPosematic employs a multi-layered approach to protect digital images:
    - The pattern is designed to be aesthetically integrated while remaining clearly artificial
    - Functions as a "digital aposematism" - a warning signal in the digital ecosystem
 
-2. **Technical Implementation**
-   - **Pixel Shuffling**: Rearranges pixels using a deterministic but non-obvious pattern
-   - **Key-Based Recovery**: Uses a separate key image to reverse the transformation
-   - **High-Frequency Noise**: Adds subtle noise patterns that disrupt feature extraction
-   - **Edge Manipulation**: Modifies edge regions to confuse edge detection algorithms
-   - **QR Code Integration**: Embeds recovery information in visually integrated QR codes
+2. **Cryptographic Implementation**
+   - **Secure Key Generation**: Utilizes cryptographically secure 128-bit keys (2^128 possible combinations) for encryption
+   - **Dual Key System**: Combines a unique image key with a 128-bit cipher key for each protected image
+   - **Operation Chaining**: Applies a sequence of reversible operations (XOR, addition, subtraction, bit rotations) defined by a customizable operation string
+   - **Steganographic Embedding**: The key image is embedded using a custom algorithm that preserves visual quality while ensuring recoverability
+   - **Defense-in-Depth**: Implements multiple layers of protection including spatial obfuscation and pixel-level transformations
 
 3. **Dual Protection**
    - **Human-Visible**: The protection is intentionally visible to establish clear provenance

@@ -25,93 +25,42 @@ class SCRAMBLE_MODE(Enum):
     BUTTERFLY = auto()  # Use butterfly pattern for key generation
     QR = auto()         # Use QR code for key generation
 
+OPS = {
+    # Addition/Subtraction with key - perfectly reversible
+    '+': lambda a, b: (a.astype(np.int32) + b.astype(np.int32)) % 256,
+    '-': lambda a, b: (a.astype(np.int32) - b.astype(np.int32)) % 256,
+    
+    # XOR with key - perfectly reversible
+    '^': lambda a, b: a.astype(np.int32) ^ b.astype(np.int32),
+    
+    # Bit rotation by 1 - perfectly reversible
+    '>': lambda a, b: ((a.astype(np.int32) >> 1) | ((a & 1) << 7)) & 0xFF,
+    '<': lambda a, b: ((a.astype(np.int32) << 1) | ((a >> 7) & 1)) & 0xFF,
+    
+    # Permutation - perfectly reversible
+    'p': lambda a, b: _permute(a),
+    'P': lambda a, b: _inverse_permute(a),
+    
+    # Add with a constant (using LSB of key for variation)
+    'a': lambda a, b: (a.astype(np.int32) + (b[0] & 0x0F) + 1) % 256,
+    'A': lambda a, b: (a.astype(np.int32) - (b[0] & 0x0F) - 1) % 256,
+}
+
+INV_OPS = {
+    '+': '-',   # a+b → a = (a+b) - b
+    '-': '+',   # a-b → a = (a-b) + b
+    '^': '^',   # XOR is its own inverse
+    '>': '<',   # Rotate right → rotate left
+    '<': '>',   # Rotate left → rotate right
+    'p': 'P',   # Permutation → inverse permutation
+    'P': 'p',   # Inverse permutation → permutation
+    'a': 'A',   # Add constant → subtract constant
+    'A': 'a',   # Subtract constant → add constant
+}
+
 # ------------------------------------------------------------------
 # Aiposematic: Scramble & Recover using image key + operation string
 # ------------------------------------------------------------------
-
-def _encrypt_b64_as_string(img_path: str, key: str = None) -> tuple:
-    """
-    Load an image, convert it to base64, and encrypt it.
-    
-    Args:
-        img_path: Path to the image file
-        key: Optional encryption key (32-byte URL-safe base64-encoded bytes).
-             If None, a new key will be generated.
-             
-    Returns:
-        tuple: (encrypted_base64_string, key_used)
-    """
-    # Read the image file as binary data
-    with open(img_path, 'rb') as img_file:
-        img_data = img_file.read()
-    
-    # Convert binary data to base64 string
-    b64_string = base64.b64encode(img_data).decode('utf-8')
-    
-    # Generate a key if none provided
-    if key is None:
-        key = Fernet.generate_key()
-    elif not isinstance(key, bytes):
-        key = key.encode('utf-8')
-    
-    # Encrypt the base64 string
-    f = Fernet(key)
-    encrypted = f.encrypt(b64_string.encode('utf-8'))
-    
-    return encrypted.decode('utf-8'), key.decode('utf-8')
-
-def _decrypt_b64_image(encrypted_data: str, key: str) -> bytes:
-    """
-    Decrypt an encrypted base64 image string back to binary data.
-    
-    Args:
-        encrypted_data: The encrypted base64 string
-        key: The encryption key used
-        
-    Returns:
-        bytes: The original image binary data
-    """
-    if not isinstance(key, bytes):
-        key = key.encode('utf-8')
-    
-    f = Fernet(key)
-    try:
-        # First decode the base64 string
-        encrypted_bytes = base64.b64decode(encrypted_data)
-        # Then decrypt the bytes
-        decrypted = f.decrypt(encrypted_bytes)
-        return decrypted
-    except Exception as e:
-        print(f"Decryption error: {str(e)}")
-        print(f"Key length: {len(key) if key else 0} bytes")
-        print(f"Encrypted data length: {len(encrypted_data) if encrypted_data else 0} chars")
-        raise
-
-
-def _b64_to_tmp_img(b64_str: str, suffix: str = '.png') -> str:
-    """
-    Convert a base64 encoded image string to a temporary image file.
-    
-    Args:
-        b64_str: Base64 encoded image string
-        suffix: File extension for the temporary file (default: '.png')
-        
-    Returns:
-        str: Path to the temporary image file
-    """
-    
-    # Decode the base64 string to binary data
-    try:
-        img_data = base64.b64decode(b64_str)
-    except Exception as e:
-        raise ValueError(f"Invalid base64 string: {str(e)}")
-    
-    # Create a temporary file with the specified suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-        temp_file.write(img_data)
-        temp_path = temp_file.name
-    
-    return temp_path
 
 def _steganography_encode(original_img_path, key_img_path, output_path=None):
     """
@@ -483,8 +432,6 @@ def _generate_qr_positions(n=5, size_range=(0.1, 0.3), canvas_size=1000, min_pad
 
 def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_size=256, output_path=None):
     """Generate a QR key image with multiple scattered QR codes on a noise background."""
-    from PIL import Image, ImageEnhance, ImageOps
-    import numpy as np
     from qrcode.image.styledpil import StyledPilImage
     from qrcode.image.styles.moduledrawers import RoundedModuleDrawer
     
@@ -604,39 +551,6 @@ def _permute(x):
 
 def _inverse_permute(x):
     return _inv_permutation[x]
-
-OPS = {
-    # Addition/Subtraction with key - perfectly reversible
-    '+': lambda a, b: (a.astype(np.int32) + b.astype(np.int32)) % 256,
-    '-': lambda a, b: (a.astype(np.int32) - b.astype(np.int32)) % 256,
-    
-    # XOR with key - perfectly reversible
-    '^': lambda a, b: a.astype(np.int32) ^ b.astype(np.int32),
-    
-    # Bit rotation by 1 - perfectly reversible
-    '>': lambda a, b: ((a.astype(np.int32) >> 1) | ((a & 1) << 7)) & 0xFF,
-    '<': lambda a, b: ((a.astype(np.int32) << 1) | ((a >> 7) & 1)) & 0xFF,
-    
-    # Permutation - perfectly reversible
-    'p': lambda a, b: _permute(a),
-    'P': lambda a, b: _inverse_permute(a),
-    
-    # Add with a constant (using LSB of key for variation)
-    'a': lambda a, b: (a.astype(np.int32) + (b[0] & 0x0F) + 1) % 256,
-    'A': lambda a, b: (a.astype(np.int32) - (b[0] & 0x0F) - 1) % 256,
-}
-
-INV_OPS = {
-    '+': '-',   # a+b → a = (a+b) - b
-    '-': '+',   # a-b → a = (a-b) + b
-    '^': '^',   # XOR is its own inverse
-    '>': '<',   # Rotate right → rotate left
-    '<': '>',   # Rotate left → rotate right
-    'p': 'P',   # Permutation → inverse permutation
-    'P': 'p',   # Inverse permutation → permutation
-    'a': 'A',   # Add constant → subtract constant
-    'A': 'a',   # Subtract constant → add constant
-}
 
 def scramble(original_img_path, key_img_path=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
     """
@@ -775,8 +689,6 @@ def get_seeded_random(seed):
 
 def shuffle_image_pixels(image_path, seed, output_path=None):
     """Shuffle the pixels of an image using a seed."""
-    from PIL import Image
-    import numpy as np
     
     # Open the image
     img = Image.open(image_path)
@@ -811,8 +723,6 @@ def shuffle_image_pixels(image_path, seed, output_path=None):
 
 def unshuffle_image_pixels(shuffled_img_path, seed, output_path=None):
     """Unshuffle an image that was shuffled with shuffle_image_pixels."""
-    from PIL import Image
-    import numpy as np
     
     # Open the image
     img = Image.open(shuffled_img_path)
@@ -870,7 +780,7 @@ def add_ai_deterrent_features(image_path, output_path):
     cv2.imwrite(output_path, img)
     return output_path
 
-def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
+def new_aposematic_img(original_img_path, cipher_key = None, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
     """
     Create a new aposematic image using pixel shuffling encryption.
     """
@@ -898,9 +808,10 @@ def new_aposematic_img(original_img_path, op_string='-^+', scramble_mode=SCRAMBL
             except:
                 pass
         raise  # Re-raise the exception
-    
-    # Step 2: Generate a secure random seed
-    seed = secrets.token_hex(16)  # 128-bit secure random seed
+    if cipher_key is None:  # Generate a secure random seed
+        seed = secrets.token_hex(16)  # 128-bit secure random seed
+    else:
+        seed = cipher_key
     
     # Step 3: Shuffle the key image
     shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name

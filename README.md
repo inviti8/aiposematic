@@ -56,8 +56,8 @@ print(f"Recovered image: {recovered_path}")
 ## Key Features
 
 - **Multiple Scrambling Modes**:
-  - `BUTTERFLY`: Creates a butterfly pattern key for scrambling
-  - `QR`: Generates a pattern of QR codes for enhanced recoverability
+  - `BUTTERFLY`: Creates a butterfly pattern key meant to confuse AI models
+  - `QR`: Generates a pattern of QR codes meant to confuse AI models
 
 - **Customizable Transformations**:
   - Chain multiple operations (+, -, ^, etc.) for custom protection schemes

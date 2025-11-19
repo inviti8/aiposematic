@@ -1,6 +1,6 @@
 """Aiposematic: Scramble & Recover using image key + operation string , By: Fibo Metavinci"""
 
-__version__ = "0.1"
+__version__ = "0.2"
 import os
 import numpy as np
 import cv2

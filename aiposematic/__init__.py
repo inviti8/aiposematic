@@ -6,7 +6,6 @@ import numpy as np
 import cv2
 from PIL import Image
 import tempfile
-import itertools
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.collections import LineCollection, PatchCollection
@@ -552,6 +551,58 @@ def _permute(x):
 def _inverse_permute(x):
     return _inv_permutation[x]
 
+def _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=False):
+    """Apply pixel operations vectorized by grouping pixels per operation character.
+
+    Instead of looping over every pixel individually, this groups all pixels that
+    share the same operation (based on their index mod len(op_string)) and applies
+    each operation as a single vectorized NumPy call.
+
+    Args:
+        pixels: ndarray of shape (n, channels), source pixel values (uint8)
+        key_pixels: ndarray of shape (n, channels), key pixel values (uint8)
+        op_string: string of operation characters (e.g. "-^+")
+        inverse: if True, apply inverse operations (for recovery)
+
+    Returns:
+        ndarray of shape (n, channels), result pixel values (uint8)
+    """
+    n = len(pixels)
+    op_len = len(op_string)
+    result = np.empty_like(pixels, dtype=np.int32)
+
+    # Precompute which operation index each pixel gets
+    op_indices = np.arange(n) % op_len
+
+    for i, op in enumerate(op_string):
+        if inverse:
+            op = INV_OPS[op]
+
+        mask = op_indices == i
+        a = pixels[mask].astype(np.int32)
+        b = key_pixels[mask]
+
+        if op == '+':
+            result[mask] = (a + b.astype(np.int32)) % 256
+        elif op == '-':
+            result[mask] = (a - b.astype(np.int32)) % 256
+        elif op == '^':
+            result[mask] = a ^ b.astype(np.int32)
+        elif op == '>':
+            result[mask] = ((a >> 1) | ((a & 1) << 7)) & 0xFF
+        elif op == '<':
+            result[mask] = ((a << 1) | ((a >> 7) & 1)) & 0xFF
+        elif op == 'p':
+            result[mask] = _permutation[pixels[mask]]
+        elif op == 'P':
+            result[mask] = _inv_permutation[pixels[mask]]
+        elif op == 'a':
+            result[mask] = (a + (b[:, 0:1].astype(np.int32) & 0x0F) + 1) % 256
+        elif op == 'A':
+            result[mask] = (a - (b[:, 0:1].astype(np.int32) & 0x0F) - 1) % 256
+
+    return result.astype(np.uint8)
+
 def scramble(original_img_path, key_img_path=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
     """
     Scramble original using key image and repeating op_string.
@@ -598,22 +649,12 @@ def scramble(original_img_path, key_img_path=None, op_string="-^+", scramble_mod
     if img.shape[:2] != key.shape[:2]:
         key = cv2.resize(key, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
     
-    # Process the image with the key
+    # Process the image with the key (vectorized)
     h, w, c = img.shape
-    locked = np.zeros_like(img)
-    
-    # Flatten and cycle operations
     pixels = img.reshape(-1, c)
     key_pixels = key.reshape(-1, c)
-    ops_cycle = itertools.cycle(op_string)
-    
-    for i in range(len(pixels)):
-        op = next(ops_cycle)
-        func = OPS[op]
-        locked_flat = func(pixels[i], key_pixels[i])
-        locked.reshape(-1, c)[i] = locked_flat
-    
-    locked = locked.astype(np.uint8)
+    locked = _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=False)
+    locked = locked.reshape(h, w, c)
     
     # Handle output path
     if output_path is None:
@@ -646,24 +687,12 @@ def recover(locked_img_path, key_img_path, op_string="-^+", output_path=None):
         key = cv2.resize(key, (locked.shape[1], locked.shape[0]), 
                         interpolation=cv2.INTER_NEAREST)
     
+    # Process the image with inverse operations (vectorized)
     h, w, c = locked.shape
-    recovered = np.zeros_like(locked)
-    
-    # Flatten the arrays for processing
     pixels = locked.reshape(-1, c)
     key_pixels = key.reshape(-1, c)
-    
-    # Process operations in the same order as scramble, but with inverted operations
-    ops_cycle = itertools.cycle(op_string)
-    
-    for i in range(len(pixels)):
-        op = next(ops_cycle)
-        inv_op = INV_OPS[op]  # Get inverse operation
-        func = OPS[inv_op]    # Get the function for inverse operation
-        recovered_flat = func(pixels[i], key_pixels[i])
-        recovered.reshape(-1, c)[i] = recovered_flat
-    
-    recovered = recovered.astype(np.uint8)
+    recovered = _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=True)
+    recovered = recovered.reshape(h, w, c)
     
     # Use a temporary file if no output path is provided
     if output_path is None:
@@ -675,17 +704,19 @@ def recover(locked_img_path, key_img_path, op_string="-^+", output_path=None):
     return output_path
 
 def get_seeded_random(seed):
-    """Create a deterministic random number generator from a seed."""
+    """Create a deterministic NumPy random number generator from a seed.
+
+    Returns an np.random.Generator seeded via SHA-256 hash of the input.
+    This is significantly faster than the stdlib random module for array
+    operations like permutation generation.
+    """
     import hashlib
-    # Use a hash of the seed to ensure good distribution
     if isinstance(seed, str):
         seed = seed.encode('utf-8')
     if not isinstance(seed, bytes):
         seed = str(seed).encode('utf-8')
     seed_hash = int(hashlib.sha256(seed).hexdigest(), 16)
-    import random
-    random.seed(seed_hash)
-    return random
+    return np.random.default_rng(seed_hash)
 
 def shuffle_image_pixels(image_path, seed, output_path=None):
     """Shuffle the pixels of an image using a seed."""
@@ -703,11 +734,10 @@ def shuffle_image_pixels(image_path, seed, output_path=None):
     # Flatten the array
     flat = arr.reshape(-1, 3)
     
-    # Generate deterministic shuffle indices
+    # Generate deterministic shuffle indices using NumPy RNG
     rng = get_seeded_random(seed)
-    indices = np.arange(total_pixels)
-    rng.shuffle(indices)
-    
+    indices = rng.permutation(total_pixels)
+
     # Apply the shuffle
     shuffled = flat[indices]
     
@@ -737,11 +767,10 @@ def unshuffle_image_pixels(shuffled_img_path, seed, output_path=None):
     # Flatten the array
     flat = arr.reshape(-1, 3)
     
-    # Generate the same shuffle indices
+    # Generate the same shuffle indices using NumPy RNG
     rng = get_seeded_random(seed)
-    indices = np.arange(total_pixels)
-    rng.shuffle(indices)
-    
+    indices = rng.permutation(total_pixels)
+
     # Create inverse mapping
     inverse_indices = np.argsort(indices)
     

@@ -1,6 +1,6 @@
 """Aiposematic: Scramble & Recover using image key + operation string , By: Fibo Metavinci"""
 
-__version__ = "0.4"
+__version__ = "1.0"
 import os
 import numpy as np
 import cv2
@@ -17,6 +17,9 @@ from enum import Enum, auto
 import base64
 from cryptography.fernet import Fernet
 import secrets
+import hashlib
+import hmac
+from math import ceil
 
 class SCRAMBLE_MODE(Enum):
     """Available modes for key generation in the scrambling process."""
@@ -24,38 +27,6 @@ class SCRAMBLE_MODE(Enum):
     BUTTERFLY = auto()  # Use butterfly pattern for key generation
     QR = auto()         # Use QR code for key generation
 
-OPS = {
-    # Addition/Subtraction with key - perfectly reversible
-    '+': lambda a, b: (a.astype(np.int32) + b.astype(np.int32)) % 256,
-    '-': lambda a, b: (a.astype(np.int32) - b.astype(np.int32)) % 256,
-    
-    # XOR with key - perfectly reversible
-    '^': lambda a, b: a.astype(np.int32) ^ b.astype(np.int32),
-    
-    # Bit rotation by 1 - perfectly reversible
-    '>': lambda a, b: ((a.astype(np.int32) >> 1) | ((a & 1) << 7)) & 0xFF,
-    '<': lambda a, b: ((a.astype(np.int32) << 1) | ((a >> 7) & 1)) & 0xFF,
-    
-    # Permutation - perfectly reversible
-    'p': lambda a, b: _permute(a),
-    'P': lambda a, b: _inverse_permute(a),
-    
-    # Add with a constant (using LSB of key for variation)
-    'a': lambda a, b: (a.astype(np.int32) + (b[0] & 0x0F) + 1) % 256,
-    'A': lambda a, b: (a.astype(np.int32) - (b[0] & 0x0F) - 1) % 256,
-}
-
-INV_OPS = {
-    '+': '-',   # a+b → a = (a+b) - b
-    '-': '+',   # a-b → a = (a-b) + b
-    '^': '^',   # XOR is its own inverse
-    '>': '<',   # Rotate right → rotate left
-    '<': '>',   # Rotate left → rotate right
-    'p': 'P',   # Permutation → inverse permutation
-    'P': 'p',   # Inverse permutation → permutation
-    'a': 'A',   # Add constant → subtract constant
-    'A': 'a',   # Subtract constant → add constant
-}
 
 # ------------------------------------------------------------------
 # Aiposematic: Scramble & Recover using image key + operation string
@@ -162,11 +133,6 @@ def _steganography_decode(encoded_img_path, output_path=None):
     
     return output_path
 
-# Precompute a permutation of 0-255 for better diffusion
-_permutation = np.random.permutation(256).astype(np.uint8)
-_inv_permutation = np.zeros(256, dtype=np.uint8)
-for i, val in enumerate(_permutation):
-    _inv_permutation[val] = i
 
 def _random_rgb():
     return (random.random(), random.random(), random.random())
@@ -545,160 +511,123 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
     print(f"QR code with noise background saved to {output_path} ({width}x{height}px)")
     return output_path
 
-def _permute(x):
-    return _permutation[x]
 
-def _inverse_permute(x):
-    return _inv_permutation[x]
+def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
+    """
+    Scramble original using butterfly/QR key image for pixel ops (aposematic visual)
+    with v1.0 key-dependent operations and per-image S-box.
 
-def _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=False):
-    """Apply pixel operations vectorized by grouping pixels per operation character.
-
-    Instead of looping over every pixel individually, this groups all pixels that
-    share the same operation (based on their index mod len(op_string)) and applies
-    each operation as a single vectorized NumPy call.
+    The butterfly/QR image IS the cryptographic key for pixel operations, preserving
+    the aposematic visual quality. The cipher_key is used to derive the S-box and
+    to shuffle the key image for steganographic storage.
 
     Args:
-        pixels: ndarray of shape (n, channels), source pixel values (uint8)
-        key_pixels: ndarray of shape (n, channels), key pixel values (uint8)
-        op_string: string of operation characters (e.g. "-^+")
-        inverse: if True, apply inverse operations (for recovery)
+        original_img_path: Path to image to scramble
+        cipher_key: 128-bit hex string for S-box derivation and key shuffling.
+                    If None, generates a new one.
+        op_string: Operation characters (partitioning model)
+        scramble_mode: Key generation mode (BUTTERFLY or QR)
+        output_path: Output path for scrambled image
 
     Returns:
-        ndarray of shape (n, channels), result pixel values (uint8)
-    """
-    n = len(pixels)
-    op_len = len(op_string)
-    result = np.empty_like(pixels, dtype=np.int32)
-
-    # Precompute which operation index each pixel gets
-    op_indices = np.arange(n) % op_len
-
-    for i, op in enumerate(op_string):
-        if inverse:
-            op = INV_OPS[op]
-
-        mask = op_indices == i
-        a = pixels[mask].astype(np.int32)
-        b = key_pixels[mask]
-
-        if op == '+':
-            result[mask] = (a + b.astype(np.int32)) % 256
-        elif op == '-':
-            result[mask] = (a - b.astype(np.int32)) % 256
-        elif op == '^':
-            result[mask] = a ^ b.astype(np.int32)
-        elif op == '>':
-            result[mask] = ((a >> 1) | ((a & 1) << 7)) & 0xFF
-        elif op == '<':
-            result[mask] = ((a << 1) | ((a >> 7) & 1)) & 0xFF
-        elif op == 'p':
-            result[mask] = _permutation[pixels[mask]]
-        elif op == 'P':
-            result[mask] = _inv_permutation[pixels[mask]]
-        elif op == 'a':
-            result[mask] = (a + (b[:, 0:1].astype(np.int32) & 0x0F) + 1) % 256
-        elif op == 'A':
-            result[mask] = (a - (b[:, 0:1].astype(np.int32) & 0x0F) - 1) % 256
-
-    return result.astype(np.uint8)
-
-def scramble(original_img_path, key_img_path=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
-    """
-    Scramble original using key image and repeating op_string.
-    
-    Returns:
-        dict: Dictionary containing:
-            - 'scrambled_path': Path to the scrambled image
-            - 'key_path': Path to the key image
+        dict: {'scrambled_path': str, 'cipher_key': str, 'key_path': str}
     """
     img = cv2.imread(original_img_path)
     if img is None:
         raise ValueError(f"Could not load image: {original_img_path}")
-    
-    # Generate a key if none provided
-    if key_img_path is None:
-        if scramble_mode == SCRAMBLE_MODE.NONE:
-            scramble_mode = SCRAMBLE_MODE.BUTTERFLY
-            
-        if scramble_mode == SCRAMBLE_MODE.BUTTERFLY:
-            key_path = _generate_butterfly_key(
-                width=img.shape[1],
-                height=img.shape[0],
-                canvas_size=max(img.shape[0], img.shape[1])
-            )
-        elif scramble_mode == SCRAMBLE_MODE.QR:
-            key_path = _generate_qr_key(
-                width=img.shape[1],
-                height=img.shape[0],
-                data=f"Aiposematic Key {os.urandom(8).hex()}",
-                canvas_size=max(img.shape[0], img.shape[1])
-            )
-        else:
-            raise ValueError(f"Unsupported scramble mode: {scramble_mode}")
-            
-        key = cv2.imread(key_path)
+
+    h, w, c = img.shape
+
+    # Generate cipher_key if not provided
+    if cipher_key is None:
+        cipher_key = secrets.token_hex(16)
+
+    # Generate visual key image (this IS the crypto key for pixel ops)
+    if scramble_mode == SCRAMBLE_MODE.NONE:
+        scramble_mode = SCRAMBLE_MODE.BUTTERFLY
+    if scramble_mode == SCRAMBLE_MODE.BUTTERFLY:
+        key_path = _generate_butterfly_key(
+            width=w, height=h, canvas_size=max(h, w)
+        )
+    elif scramble_mode == SCRAMBLE_MODE.QR:
+        key_path = _generate_qr_key(
+            width=w, height=h,
+            data=f"Aiposematic Key {os.urandom(8).hex()}",
+            canvas_size=max(h, w)
+        )
     else:
-        # Use provided key image
-        key = cv2.imread(key_img_path)
-        if key is None:
-            raise ValueError(f"Could not load key image: {key_img_path}")
-        key_path = key_img_path
-    
+        raise ValueError(f"Unsupported scramble mode: {scramble_mode}")
+
+    key = cv2.imread(key_path)
+    if key is None:
+        raise ValueError(f"Could not load generated key image: {key_path}")
+
     # Resize key to match input image if needed
     if img.shape[:2] != key.shape[:2]:
-        key = cv2.resize(key, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-    
-    # Process the image with the key (vectorized)
-    h, w, c = img.shape
+        key = cv2.resize(key, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    # Derive per-image S-box from cipher_key
+    sbox, inv_sbox = _derive_sbox(cipher_key)
+
+    # Flatten and apply v1.0 ops (partitioning model, all ops key-dependent)
     pixels = img.reshape(-1, c)
     key_pixels = key.reshape(-1, c)
-    locked = _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=False)
+    locked = _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=False)
     locked = locked.reshape(h, w, c)
-    
+
     # Handle output path
     if output_path is None:
-        import tempfile
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-    
-    # Save the scrambled image
+
     cv2.imwrite(output_path, locked)
     print(f"Scrambled image saved to: {output_path}")
-    
+
     return {
         'scrambled_path': output_path,
+        'cipher_key': cipher_key,
         'key_path': key_path
     }
 
-def recover(locked_img_path, key_img_path, op_string="-^+", output_path=None):
+def recover(locked_img_path, key_img_path, cipher_key, op_string="-^+", output_path=None):
     """
-    Recover original using same key and op_string.
+    Recover original using key image + v1.0 key-dependent inverse operations.
+
+    Args:
+        locked_img_path: Path to scrambled image
+        key_img_path: Path to the key image used during scrambling
+        cipher_key: The cipher_key used for S-box derivation
+        op_string: Same op_string used during scrambling
+        output_path: Output path for recovered image
+
+    Returns:
+        str: Path to recovered image
     """
     locked = cv2.imread(locked_img_path)
     if locked is None:
         raise ValueError(f"Could not load locked image: {locked_img_path}")
-    
+
     key = cv2.imread(key_img_path)
     if key is None:
         raise ValueError(f"Could not load key image: {key_img_path}")
-    
+
+    h, w, c = locked.shape
+
     # Resize key to match locked image if needed
     if locked.shape[:2] != key.shape[:2]:
-        key = cv2.resize(key, (locked.shape[1], locked.shape[0]), 
-                        interpolation=cv2.INTER_NEAREST)
-    
-    # Process the image with inverse operations (vectorized)
-    h, w, c = locked.shape
+        key = cv2.resize(key, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    # Derive per-image S-box from cipher_key
+    sbox, inv_sbox = _derive_sbox(cipher_key)
+
+    # Flatten and apply inverse ops (partitioning model)
     pixels = locked.reshape(-1, c)
     key_pixels = key.reshape(-1, c)
-    recovered = _apply_ops_vectorized(pixels, key_pixels, op_string, inverse=True)
+    recovered = _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=True)
     recovered = recovered.reshape(h, w, c)
-    
-    # Use a temporary file if no output path is provided
+
     if output_path is None:
-        import tempfile
         output_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-    
+
     cv2.imwrite(output_path, recovered)
     print(f"Recovered image saved: {output_path}")
     return output_path
@@ -710,13 +639,226 @@ def get_seeded_random(seed):
     This is significantly faster than the stdlib random module for array
     operations like permutation generation.
     """
-    import hashlib
     if isinstance(seed, str):
         seed = seed.encode('utf-8')
     if not isinstance(seed, bytes):
         seed = str(seed).encode('utf-8')
     seed_hash = int(hashlib.sha256(seed).hexdigest(), 16)
     return np.random.default_rng(seed_hash)
+
+# ------------------------------------------------------------------
+# v1.0 Crypto Primitives
+# ------------------------------------------------------------------
+
+def _derive_key_image(cipher_key, width, height):
+    """Derive a full-entropy pseudorandom key image from the cipher_key.
+
+    Uses HMAC-SHA256 in counter mode (NIST SP 800-108 style KDF).
+
+    Args:
+        cipher_key: The 128-bit hex string (from secrets.token_hex(16))
+        width: Image width in pixels
+        height: Image height in pixels
+
+    Returns:
+        ndarray of shape (height, width, 3), dtype=uint8, pseudorandom values
+    """
+    total_bytes = width * height * 3
+    num_blocks = ceil(total_bytes / 32)
+
+    key_bytes = bytearray()
+    master = cipher_key.encode('utf-8')
+
+    for block_idx in range(num_blocks):
+        block = hmac.new(
+            master,
+            b"aiposematic-v1.0-key" + block_idx.to_bytes(4, 'big'),
+            hashlib.sha256
+        ).digest()
+        key_bytes.extend(block)
+
+    return np.frombuffer(
+        bytes(key_bytes[:total_bytes]), dtype=np.uint8
+    ).reshape(height, width, 3)
+
+def _derive_sbox(cipher_key):
+    """Derive a deterministic 256-byte S-box from cipher_key.
+
+    Uses Fisher-Yates shuffle via NumPy RNG seeded by cipher_key.
+
+    Returns:
+        (forward_sbox, inverse_sbox) — both ndarray of shape (256,), dtype=uint8
+    """
+    rng = get_seeded_random(cipher_key + ":sbox")
+    forward = rng.permutation(256).astype(np.uint8)
+    inverse = np.zeros(256, dtype=np.uint8)
+    for i, val in enumerate(forward):
+        inverse[val] = i
+    return forward, inverse
+
+def _derive_diffusion_init(cipher_key):
+    """Derive a diffusion initialization byte from cipher_key.
+
+    Returns:
+        int (0-255) for XOR chain initialization
+    """
+    return int(hmac.new(
+        cipher_key.encode('utf-8'),
+        b"aiposematic-v1.0-diffusion",
+        hashlib.sha256
+    ).hexdigest()[:2], 16)
+
+def _key_rotate_right(a, b):
+    """Rotate each byte right by (key_byte % 7) + 1 bits (1-7)."""
+    shift = (b % 7) + 1
+    return ((a >> shift) | (a << (8 - shift))) & 0xFF
+
+def _key_rotate_left(a, b):
+    """Rotate each byte left by (key_byte % 7) + 1 bits (1-7)."""
+    shift = (b % 7) + 1
+    return ((a << shift) | (a >> (8 - shift))) & 0xFF
+
+# ------------------------------------------------------------------
+# v1.0 Operations (all key-dependent) + Composition
+# ------------------------------------------------------------------
+
+V1_OPS = {
+    '+': lambda a, b, s, si: (a + b) % 256,
+    '-': lambda a, b, s, si: (a - b) % 256,
+    '^': lambda a, b, s, si: a ^ b,
+    '>': lambda a, b, s, si: _key_rotate_right(a, b),
+    '<': lambda a, b, s, si: _key_rotate_left(a, b),
+    'p': lambda a, b, s, si: s[(a ^ b) & 0xFF],
+    'P': lambda a, b, s, si: si[a] ^ (b & 0xFF),
+    'a': lambda a, b, s, si: (a + ((b[:, 0] + b[:, 1] + b[:, 2]) % 256).reshape(-1, 1)) % 256,
+    'A': lambda a, b, s, si: (a - ((b[:, 0] + b[:, 1] + b[:, 2]) % 256).reshape(-1, 1)) % 256,
+}
+
+V1_INV_OPS = {
+    '+': '-',
+    '-': '+',
+    '^': '^',
+    '>': '<',
+    '<': '>',
+    'p': 'P',
+    'P': 'p',
+    'a': 'A',
+    'A': 'a',
+}
+
+def _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=False):
+    """Apply operations via partitioning: pixel_i gets op_string[i % L].
+
+    Each pixel receives one operation from the op_string cycle. All operations
+    are key-dependent (v1.0 improvement over v0.4).
+
+    Args:
+        pixels:     (N, 3) uint8 — source pixel values
+        key_pixels: (N, 3) uint8 — derived key values
+        op_string:  string of operation characters
+        sbox:       (256,) uint8 — derived forward S-box
+        inv_sbox:   (256,) uint8 — derived inverse S-box
+        inverse:    if True, apply inverse operations
+
+    Returns:
+        (N, 3) uint8 — result pixel values
+    """
+    n = len(pixels)
+    op_len = len(op_string)
+    result = np.empty_like(pixels, dtype=np.int32)
+
+    op_indices = np.arange(n) % op_len
+
+    for i, op_char in enumerate(op_string):
+        if inverse:
+            op_char = V1_INV_OPS[op_char]
+
+        mask = op_indices == i
+        a = pixels[mask].astype(np.int32)
+        b = key_pixels[mask].astype(np.int32)
+
+        op_fn = V1_OPS[op_char]
+        result[mask] = np.asarray(op_fn(a, b, sbox, inv_sbox))
+
+    return result.astype(np.uint8)
+
+# ------------------------------------------------------------------
+# v1.0 Block Diffusion
+# ------------------------------------------------------------------
+
+def _apply_diffusion(pixels, init_byte):
+    """Block-wise XOR diffusion (block size 64).
+
+    Each block is XORed with a hash-derived chain value from the previous block.
+    First block is XORed with key-derived IV.
+
+    Args:
+        pixels:    (N, 3) uint8
+        init_byte: int (0-255) — derived initialization value
+
+    Returns:
+        (N, 3) uint8 — diffused pixel values
+    """
+    BLOCK = 64
+    result = pixels.copy()
+    n = len(result)
+
+    iv = np.array([init_byte, init_byte, init_byte], dtype=np.uint8)
+    prev_hash = iv.astype(np.int32)
+
+    for start in range(0, n, BLOCK):
+        end = min(start + BLOCK, n)
+        block = result[start:end]
+
+        tile = np.tile(prev_hash, (end - start, 1)).astype(np.int32)
+        result[start:end] = (block.astype(np.int32) ^ tile) & 0xFF
+
+        block_bytes = result[start:end].astype(np.uint8).tobytes()
+        prev_hash = np.frombuffer(
+            hashlib.sha256(block_bytes).digest()[:3], dtype=np.uint8
+        ).astype(np.int32)
+
+    return result.astype(np.uint8)
+
+def _remove_diffusion(pixels, init_byte):
+    """Reverse block-wise XOR diffusion.
+
+    Recomputes forward chain values, then undoes XOR in reverse block order.
+
+    Args:
+        pixels:    (N, 3) uint8
+        init_byte: int (0-255) — same init used during apply
+
+    Returns:
+        (N, 3) uint8 — undiffused pixel values
+    """
+    BLOCK = 64
+    result = pixels.copy()
+    n = len(result)
+
+    # First pass: collect all chain values (forward order)
+    iv = np.array([init_byte, init_byte, init_byte], dtype=np.uint8)
+    chain_values = [iv.astype(np.int32)]
+
+    for start in range(0, n, BLOCK):
+        end = min(start + BLOCK, n)
+        block_bytes = result[start:end].astype(np.uint8).tobytes()
+        hv = np.frombuffer(
+            hashlib.sha256(block_bytes).digest()[:3], dtype=np.uint8
+        ).astype(np.int32)
+        chain_values.append(hv)
+
+    # Second pass: undo XOR in reverse order
+    num_blocks = ceil(n / BLOCK)
+    for blk_idx in range(num_blocks - 1, -1, -1):
+        start = blk_idx * BLOCK
+        end = min(start + BLOCK, n)
+        prev_hash = chain_values[blk_idx]
+
+        tile = np.tile(prev_hash, (end - start, 1)).astype(np.int32)
+        result[start:end] = (result[start:end].astype(np.int32) ^ tile) & 0xFF
+
+    return result.astype(np.uint8)
 
 def shuffle_image_pixels(image_path, seed, output_path=None):
     """Shuffle the pixels of an image using a seed."""
@@ -809,92 +951,99 @@ def add_ai_deterrent_features(image_path, output_path):
     cv2.imwrite(output_path, img)
     return output_path
 
-def new_aposematic_img(original_img_path, cipher_key = None, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
+def new_aposematic_img(original_img_path, cipher_key=None, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
     """
-    Create a new aposematic image using pixel shuffling encryption.
+    Create a new aposematic image.
+
+    Pipeline:
+      1. Apply AI deterrent features
+      2. Scramble with butterfly/QR key image + v1.0 key-dependent ops
+      3. Shuffle key image using cipher_key as seed
+      4. Embed shuffled key via steganography
+
+    Returns:
+        dict: {'img_path': str, 'cipher_key': str}
     """
-    # Create a temporary file for the AI-deterred image
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
         temp_path = temp_file.name
-    
+
+    if cipher_key is None:
+        cipher_key = secrets.token_hex(16)
+
     try:
-        # Step 0: Apply AI deterrent features to the original image
+        # Step 1: Apply AI deterrent features
         deterred_path = add_ai_deterrent_features(original_img_path, temp_path)
-        
-        # Step 1: Scramble the original image with AI deterrents
+
+        # Step 2: Scramble (butterfly/QR key is the crypto key for pixel ops)
         result = scramble(
             original_img_path=deterred_path,
-            key_img_path=None,  # Generate a new key
+            cipher_key=cipher_key,
             op_string=op_string,
             scramble_mode=scramble_mode,
-            output_path=None  # Will generate a temp path
+            output_path=None
         )
-    except Exception as e:
-        # Clean up the temporary file if it exists
-        if os.path.exists(temp_path):
+
+        # Step 3: Shuffle the key image using cipher_key as seed
+        shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        shuffle_image_pixels(result['key_path'], cipher_key, shuffled_key_path)
+
+        # Step 4: Embed shuffled key via steganography
+        final_image_path = output_path or tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        _steganography_encode(result['scrambled_path'], shuffled_key_path, final_image_path)
+
+    finally:
+        temp_files = [temp_path]
+        if 'result' in locals():
+            temp_files.extend([result['scrambled_path'], result['key_path']])
+        if 'shuffled_key_path' in locals():
+            temp_files.append(shuffled_key_path)
+        for path in temp_files:
             try:
-                os.unlink(temp_path)
-            except:
-                pass
-        raise  # Re-raise the exception
-    if cipher_key is None:  # Generate a secure random seed
-        seed = secrets.token_hex(16)  # 128-bit secure random seed
-    else:
-        seed = cipher_key
-    
-    # Step 3: Shuffle the key image
-    shuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-    shuffle_image_pixels(result['key_path'], seed, shuffled_key_path)
-    
-    # Step 4: Hide the shuffled key in the scrambled image
-    final_image_path = output_path or tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-    _steganography_encode(result['scrambled_path'], shuffled_key_path, final_image_path)
-    
-    # Clean up temporary files
-    temp_files = [result['scrambled_path'], result['key_path'], shuffled_key_path, temp_path]
-    for path in temp_files:
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except Exception as e:
-            print(f"Warning: Could not delete temporary file {path}: {e}")
-    
+                if os.path.exists(path):
+                    os.unlink(path)
+            except Exception as e:
+                print(f"Warning: Could not delete temporary file {path}: {e}")
+
     return {
         'img_path': final_image_path,
-        'cipher_key': seed  # Return the seed as the encryption key
+        'cipher_key': cipher_key
     }
 
 def recover_aposematic_img(aposematic_img_path, cipher_key, op_string='-^+', output_path=None):
     """
-    Recover the original image from an aposematic image using pixel unshuffling.
+    Recover the original image from an aposematic image.
+
+    Pipeline:
+      1. Extract shuffled key image from steganographic payload
+      2. Unshuffle key image using cipher_key
+      3. Recover with key image + v1.0 inverse ops
     """
     try:
         # Step 1: Extract the shuffled key image
         shuffled_key_path = _steganography_decode(aposematic_img_path)
-        
+
         try:
             # Step 2: Unshuffle the key image
             unshuffled_key_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
             unshuffle_image_pixels(shuffled_key_path, cipher_key, unshuffled_key_path)
-            
+
             try:
-                # Step 3: Recover the original image
+                # Step 3: Recover using key image + v1.0 ops
                 recovered_path = recover(
                     locked_img_path=aposematic_img_path,
                     key_img_path=unshuffled_key_path,
+                    cipher_key=cipher_key,
                     op_string=op_string,
                     output_path=output_path
                 )
                 return recovered_path
             finally:
-                # Clean up the unshuffled key
                 if os.path.exists(unshuffled_key_path):
                     os.unlink(unshuffled_key_path)
         finally:
-            # Clean up the extracted key
             if os.path.exists(shuffled_key_path):
                 os.unlink(shuffled_key_path)
-                
+
     except Exception as e:
         print(f"Error recovering aposematic image: {str(e)}")
         raise

@@ -1,5 +1,6 @@
 import cv2
 import os
+import numpy as np
 import tempfile
 from aiposematic import (
     SCRAMBLE_MODE,
@@ -20,24 +21,26 @@ def display_image(title, image_path, display_time=4000):
         print(f"Warning: Could not display {image_path}")
 
 def test_scramble_recover(input_image, mode, op_sequence="-^+"):
-    """Test scrambling and recovering an image with the given mode."""
+    """Test v1.0 scramble/recover with key image + cipher_key."""
     print(f"\n{'='*50}")
-    print(f"Testing with {mode.name} key generation")
+    print(f"Testing v1.0 scramble/recover with {mode.name} key")
     print("="*50 + "\n")
 
     # Scramble the image
     print("Scrambling with", mode.name, "key...")
     result = scramble(
         original_img_path=input_image,
-        key_img_path=None,  # Generate a new key
+        cipher_key=None,  # Generate a new cipher_key
         op_string=op_sequence,
         scramble_mode=mode,
-        output_path=None  # Will generate a temp path
+        output_path=None
     )
-    
+
     scrambled_path = result['scrambled_path']
+    cipher_key = result['cipher_key']
     key_path = result['key_path']
-    print(f"Generated key: {key_path}")
+    print(f"Cipher key: {cipher_key}")
+    print(f"Key image: {key_path}")
     print(f"Scrambled image saved to: {scrambled_path}")
 
     # Display the original, key, and scrambled images
@@ -50,28 +53,38 @@ def test_scramble_recover(input_image, mode, op_sequence="-^+"):
     recovered_path = recover(
         locked_img_path=scrambled_path,
         key_img_path=key_path,
+        cipher_key=cipher_key,
         op_string=op_sequence
     )
     print(f"Recovered image saved: {recovered_path}")
     display_image("Recovered Image (Correct Key)", recovered_path)
 
-    # Test recovery with wrong key (should fail)
-    print("\nTesting with wrong key...")
-    try:
-        wrong_recovered = recover(
-            locked_img_path=scrambled_path,
-            key_img_path=input_image,  # Using original image as wrong key
-            op_string=op_sequence
-        )
-        print(f"Recovered image saved: {wrong_recovered}")
-        display_image("Recovered Image (Wrong Key)", wrong_recovered)
-        print("WARNING: Recovery succeeded with wrong key! This may indicate a security issue.")
-    except Exception as e:
-        print(f"Expected error with wrong key (this is good): {str(e)}")
+    # Verify pixel-perfect recovery
+    original_img = cv2.imread(input_image)
+    recovered_img = cv2.imread(recovered_path)
+    if np.array_equal(original_img, recovered_img):
+        print("PASS: Pixel-perfect recovery!")
+    else:
+        diff = np.abs(original_img.astype(int) - recovered_img.astype(int))
+        print(f"WARN: Recovery not pixel-perfect. Max diff: {diff.max()}, Mean diff: {diff.mean():.4f}")
+
+    # Test recovery with wrong key (should produce garbage)
+    print("\nTesting with wrong cipher_key...")
+    wrong_key = "00" * 16
+    wrong_recovered = recover(
+        locked_img_path=scrambled_path,
+        key_img_path=key_path,
+        cipher_key=wrong_key,
+        op_string=op_sequence
+    )
+    wrong_img = cv2.imread(wrong_recovered)
+    if not np.array_equal(original_img, wrong_img):
+        print("PASS: Wrong cipher_key produces different output.")
+    else:
+        print("FAIL: Wrong cipher_key produced identical output!")
 
     # Clean up
-    for path in [scrambled_path, key_path, recovered_path, 
-                'recovered.png', 'wrong_key.png', 'failed_recovery.png']:
+    for path in [scrambled_path, key_path, recovered_path, wrong_recovered]:
         try:
             if os.path.exists(path):
                 os.unlink(path)
@@ -81,9 +94,9 @@ def test_scramble_recover(input_image, mode, op_sequence="-^+"):
 def test_aposematic_workflow(input_image, mode=SCRAMBLE_MODE.BUTTERFLY):
     """Test the complete aposematic image workflow."""
     print("\n" + "="*50)
-    print(f"Testing Aposematic Image Workflow with {mode.name} Key")
+    print(f"Testing Aposematic Workflow with {mode.name} Key")
     print("="*50)
-    
+
     # 1. Create a new aposematic image
     print("\nCreating aposematic image...")
     result = new_aposematic_img(
@@ -93,13 +106,13 @@ def test_aposematic_workflow(input_image, mode=SCRAMBLE_MODE.BUTTERFLY):
     )
     aposematic_path = result['img_path']
     cipher_key = result['cipher_key']
-    
+
     print(f"\nAposematic image created at: {aposematic_path}")
-    print(f"Cipher key (truncated): {cipher_key[:30]}...")
-    
+    print(f"Cipher key: {cipher_key}")
+
     # Display the aposematic image
     display_image(f"Aposematic Image ({mode.name} Key)", aposematic_path)
-    
+
     # 2. Recover the original image
     print("\nRecovering original image...")
     recovered_path = recover_aposematic_img(
@@ -108,10 +121,10 @@ def test_aposematic_workflow(input_image, mode=SCRAMBLE_MODE.BUTTERFLY):
         op_string="-^+"
     )
     print(f"Recovered image saved to: {recovered_path}")
-    
+
     # Display the recovered image
     display_image(f"Recovered Image ({mode.name} Key)", recovered_path)
-    
+
     # Clean up
     for path in [aposematic_path, recovered_path]:
         try:
@@ -120,37 +133,80 @@ def test_aposematic_workflow(input_image, mode=SCRAMBLE_MODE.BUTTERFLY):
         except Exception as e:
             print(f"Warning: Could not delete {path}: {e}")
 
+def test_wrong_key_v1(input_image):
+    """Wrong cipher_key produces garbage, not partial recovery."""
+    print("\n" + "="*50)
+    print("Testing v1.0: Wrong Key Produces Garbage")
+    print("="*50)
+
+    result = new_aposematic_img(
+        original_img_path=input_image,
+        op_string="-^+",
+    )
+
+    # Recover with wrong key
+    wrong_key = "ff" * 16
+    wrong_recovered = recover_aposematic_img(
+        aposematic_img_path=result['img_path'],
+        cipher_key=wrong_key,
+        op_string="-^+"
+    )
+
+    # Recover with correct key
+    correct_recovered = recover_aposematic_img(
+        aposematic_img_path=result['img_path'],
+        cipher_key=result['cipher_key'],
+        op_string="-^+"
+    )
+
+    wrong_img = cv2.imread(wrong_recovered)
+    correct_img = cv2.imread(correct_recovered)
+
+    if not np.array_equal(wrong_img, correct_img):
+        diff = np.abs(wrong_img.astype(int) - correct_img.astype(int))
+        print(f"PASS: Wrong key output differs. Mean diff: {diff.mean():.1f}")
+    else:
+        print("FAIL: Wrong key produced same output as correct key!")
+
+    for path in [result['img_path'], wrong_recovered, correct_recovered]:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except:
+            pass
+
 def main():
-    # Input image
     input_image = "original.png"
-    
-    # Check if the image exists
+
     if not os.path.exists(input_image):
         raise FileNotFoundError(
             f"Test image '{input_image}' not found in the repository. "
             "Please ensure it exists in the current directory."
         )
-    
+
     print(f"Using test image: {input_image}")
     img = cv2.imread(input_image)
     if img is None:
         raise ValueError(f"Could not read image: {input_image}")
     print(f"Image dimensions: {img.shape[1]}x{img.shape[0]}\n")
-    
-    # Test basic scramble/recover for each mode
+
+    # Test basic scramble/recover
     print("\n" + "="*50)
     print("Testing Basic Scramble/Recovery")
     print("="*50)
     for mode in [SCRAMBLE_MODE.BUTTERFLY, SCRAMBLE_MODE.QR]:
         test_scramble_recover(input_image, mode)
-    
-    # Test aposematic workflow for each mode
+
+    # Test aposematic workflow
     print("\n" + "="*50)
     print("Testing Aposematic Workflow")
     print("="*50)
     for mode in [SCRAMBLE_MODE.BUTTERFLY, SCRAMBLE_MODE.QR]:
         test_aposematic_workflow(input_image, mode)
-    
+
+    # v1.0 wrong key test
+    test_wrong_key_v1(input_image)
+
     print("\nAll tests completed!")
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Unit tests for aiposematic v1.0 crypto primitives and round-trip."""
+"""Unit tests for aiposematic v1.1 crypto primitives and round-trip."""
 
 import unittest
 import numpy as np
@@ -12,13 +12,23 @@ from aiposematic import (
     _remove_diffusion,
     V1_OPS,
     V1_INV_OPS,
+    OP_INTENSITY,
     scramble,
     recover,
     SCRAMBLE_MODE,
+    derive_cipher_key,
+    derive_subscriber_cipher_key,
 )
 import os
 import cv2
 import tempfile
+
+try:
+    from hvym_stellar import Stellar25519KeyPair
+    from stellar_sdk import Keypair as StellarKeypair
+    _HAS_STELLAR = True
+except ImportError:
+    _HAS_STELLAR = False
 
 
 class TestDeriveSbox(unittest.TestCase):
@@ -345,6 +355,212 @@ class TestIntegration(unittest.TestCase):
         os.unlink(result1['key_path'])
         os.unlink(result2['scrambled_path'])
         os.unlink(result2['key_path'])
+
+
+class TestPerOpIntensity(unittest.TestCase):
+    """Tests for v1.1 per-op intensity scaling."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_img_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        img = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        cv2.imwrite(cls.test_img_path, img)
+
+    @classmethod
+    def tearDownClass(cls):
+        if os.path.exists(cls.test_img_path):
+            os.unlink(cls.test_img_path)
+
+    def test_single_op_roundtrip(self):
+        """Each single-op roundtrip is pixel-perfect at its intensity."""
+        for op_char in OP_INTENSITY:
+            result = scramble(self.test_img_path, op_string=op_char)
+            recovered = recover(
+                result['scrambled_path'],
+                key_img_path=result['key_path'],
+                cipher_key=result['cipher_key'],
+                op_string=op_char,
+            )
+            original = cv2.imread(self.test_img_path)
+            rec_img = cv2.imread(recovered)
+            np.testing.assert_array_equal(
+                original, rec_img,
+                err_msg=f"Roundtrip failed for single op '{op_char}'"
+            )
+            os.unlink(result['scrambled_path'])
+            os.unlink(result['key_path'])
+            os.unlink(recovered)
+
+    def test_intensity_gradient(self):
+        """Mild ops produce less disruption than strong ops."""
+        rng = np.random.default_rng(42)
+        pixels = rng.integers(0, 256, size=(500, 3)).astype(np.uint8)
+        key_pixels = rng.integers(0, 256, size=(500, 3)).astype(np.uint8)
+        sbox, inv_sbox = _derive_sbox("intensity_test")
+
+        # Mild op '>' (intensity 0.15) vs strong op '+' (intensity 1.0)
+        mild = _apply_ops_v1(pixels, key_pixels, ">", sbox, inv_sbox)
+        strong = _apply_ops_v1(pixels, key_pixels, "+", sbox, inv_sbox)
+
+        mild_diff = np.abs(mild.astype(float) - pixels.astype(float)).mean()
+        strong_diff = np.abs(strong.astype(float) - pixels.astype(float)).mean()
+
+        self.assertLess(mild_diff, strong_diff,
+                       f"Mild op '>' (diff={mild_diff:.1f}) should produce less disruption than '+' (diff={strong_diff:.1f})")
+
+    def test_partitioned_intensity_roundtrip(self):
+        """Mixed intensity op_string roundtrip is pixel-perfect."""
+        rng = np.random.default_rng(42)
+        pixels = rng.integers(0, 256, size=(500, 3)).astype(np.uint8)
+        key_pixels = rng.integers(0, 256, size=(500, 3)).astype(np.uint8)
+        sbox, inv_sbox = _derive_sbox("mixed_test")
+
+        for op_string in [">a", "p<", "+>-<", "-^+p>a<PA"]:
+            scrambled = _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=False)
+            recovered = _apply_ops_v1(scrambled, key_pixels, op_string, sbox, inv_sbox, inverse=True)
+            np.testing.assert_array_equal(
+                recovered, pixels,
+                err_msg=f"Intensity roundtrip failed for op_string='{op_string}'"
+            )
+
+    def test_rotation_max_shift_scaling(self):
+        """Rotation ops with low intensity use fewer shift bits."""
+        rng = np.random.default_rng(42)
+        a = rng.integers(0, 256, size=(100, 3), dtype=np.int32)
+        k = rng.integers(0, 256, size=(100, 3), dtype=np.int32)
+
+        # max_shift=2 (intensity 0.15 → max(2, round(7*0.15))=max(2,1)=2)
+        r_mild = _key_rotate_right(a, k, max_shift=2)
+        # max_shift=7 (intensity 1.0 → max(2, round(7*1.0))=7)
+        r_full = _key_rotate_right(a, k, max_shift=7)
+
+        # Both should be valid 8-bit values
+        self.assertTrue(np.all(r_mild >= 0))
+        self.assertTrue(np.all(r_mild <= 255))
+        self.assertTrue(np.all(r_full >= 0))
+        self.assertTrue(np.all(r_full <= 255))
+
+        # And they should generally differ
+        self.assertFalse(np.array_equal(r_mild, r_full))
+
+
+class TestStellarKeyDerivation(unittest.TestCase):
+    """Tests for Stellar keypair-based cipher key derivation."""
+
+    @unittest.skipUnless(_HAS_STELLAR, "hvym-stellar not installed")
+    def test_derive_cipher_key_deterministic(self):
+        """Same keypair produces same cipher_key."""
+        kp = Stellar25519KeyPair(StellarKeypair.random())
+        key1 = derive_cipher_key(kp)
+        key2 = derive_cipher_key(kp)
+        self.assertEqual(key1, key2)
+        self.assertEqual(len(key1), 32)
+
+    @unittest.skipUnless(_HAS_STELLAR, "hvym-stellar not installed")
+    def test_different_keypairs_different_keys(self):
+        """Different keypairs produce different cipher_keys."""
+        kp1 = Stellar25519KeyPair(StellarKeypair.random())
+        kp2 = Stellar25519KeyPair(StellarKeypair.random())
+        self.assertNotEqual(derive_cipher_key(kp1), derive_cipher_key(kp2))
+
+    @unittest.skipUnless(_HAS_STELLAR, "hvym-stellar not installed")
+    def test_ecdh_symmetric(self):
+        """ECDH derivation is symmetric: artist→subscriber == subscriber→artist."""
+        artist_kp = Stellar25519KeyPair(StellarKeypair.random())
+        subscriber_kp = Stellar25519KeyPair(StellarKeypair.random())
+
+        key_from_artist = derive_subscriber_cipher_key(artist_kp, subscriber_kp.public_key())
+        key_from_subscriber = derive_subscriber_cipher_key(subscriber_kp, artist_kp.public_key())
+
+        self.assertEqual(key_from_artist, key_from_subscriber)
+        self.assertEqual(len(key_from_artist), 32)
+
+
+class TestStellarIntegration(unittest.TestCase):
+    """Integration tests for Stellar keypair-based scramble/recover."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_img_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        img = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        cv2.imwrite(cls.test_img_path, img)
+
+    @classmethod
+    def tearDownClass(cls):
+        if os.path.exists(cls.test_img_path):
+            os.unlink(cls.test_img_path)
+
+    @unittest.skipUnless(_HAS_STELLAR, "hvym-stellar not installed")
+    def test_stellar_self_recovery(self):
+        """Artist scramble + self-recover via same keypair is pixel-perfect."""
+        kp = Stellar25519KeyPair(StellarKeypair.random())
+        result = scramble(self.test_img_path, op_string="-^+", stellar_keypair=kp)
+        recovered = recover(
+            result['scrambled_path'],
+            key_img_path=result['key_path'],
+            op_string="-^+",
+            stellar_keypair=kp,
+        )
+
+        original = cv2.imread(self.test_img_path)
+        rec_img = cv2.imread(recovered)
+        np.testing.assert_array_equal(original, rec_img)
+
+        os.unlink(result['scrambled_path'])
+        os.unlink(result['key_path'])
+        os.unlink(recovered)
+
+    @unittest.skipUnless(_HAS_STELLAR, "hvym-stellar not installed")
+    def test_ecdh_subscriber_roundtrip(self):
+        """ECDH: artist scrambles for subscriber, subscriber recovers."""
+        artist_kp = Stellar25519KeyPair(StellarKeypair.random())
+        subscriber_kp = Stellar25519KeyPair(StellarKeypair.random())
+
+        # Artist scrambles for subscriber
+        result = scramble(
+            self.test_img_path,
+            op_string="-^+",
+            stellar_keypair=artist_kp,
+            subscriber_public_key=subscriber_kp.public_key(),
+        )
+
+        # Subscriber recovers using their own keypair + artist's public key
+        recovered = recover(
+            result['scrambled_path'],
+            key_img_path=result['key_path'],
+            op_string="-^+",
+            stellar_keypair=subscriber_kp,
+            artist_public_key=artist_kp.public_key(),
+        )
+
+        original = cv2.imread(self.test_img_path)
+        rec_img = cv2.imread(recovered)
+        np.testing.assert_array_equal(original, rec_img)
+
+        os.unlink(result['scrambled_path'])
+        os.unlink(result['key_path'])
+        os.unlink(recovered)
+
+    def test_no_key_generates_random(self):
+        """Scramble without cipher_key or stellar_keypair generates a random key."""
+        result = scramble(self.test_img_path, op_string="-^+")
+        self.assertIsNotNone(result['cipher_key'])
+        self.assertEqual(len(result['cipher_key']), 32)  # secrets.token_hex(16) = 32 chars
+
+        os.unlink(result['scrambled_path'])
+        os.unlink(result['key_path'])
+
+    def test_recover_without_key_raises(self):
+        """Recover without any key source raises ValueError."""
+        result = scramble(self.test_img_path, op_string="-^+")
+        with self.assertRaises(ValueError):
+            recover(
+                result['scrambled_path'],
+                key_img_path=result['key_path'],
+                op_string="-^+",
+            )
+        os.unlink(result['scrambled_path'])
+        os.unlink(result['key_path'])
 
 
 if __name__ == '__main__':

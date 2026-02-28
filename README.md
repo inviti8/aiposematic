@@ -1,4 +1,4 @@
-# AIPosematic v1.0: Overt Adversarial Protection for Digital Art
+# AIPosematic v1.1: Overt Adversarial Protection for Digital Art
 
 AIPosematic is a Python package inspired by nature's defense mechanisms, designed to help artists and creators protect their digital artwork in an overt and visually distinctive way. Unlike traditional digital watermarking or covert adversarial examples, AIPosematic applies visible, intentional transformations that signal the work is protected while simultaneously disrupting AI training processes.
 
@@ -11,9 +11,11 @@ AIPosematic employs a multi-layered approach to protect digital images:
    - The pattern is designed to be aesthetically integrated while remaining clearly artificial
    - Functions as a "digital aposematism" - a warning signal in the digital ecosystem
 
-2. **Cryptographic Implementation (v1.0)**
+2. **Cryptographic Implementation (v1.1)**
    - **Secure Key Generation**: Generates a unique butterfly or QR code key image per image, used as the cryptographic key for pixel operations while preserving the aposematic visual quality
    - **128-bit Cipher Key**: Each image gets a unique cipher key (`secrets.token_hex(16)`) used for S-box derivation and key image shuffling
+   - **Per-Op Intensity Scaling** (v1.1): Each operation has an intrinsic intensity that controls its disruption level, restoring the aposematic gradient so the op_string "dial" controls warning signal strength
+   - **Stellar Key Integration** (v1.1): Cipher keys can be derived from `hvym-stellar` Stellar25519 keypairs, eliminating manual hex key management. Supports ECDH for artist-to-subscriber key agreement
    - **Key-Dependent Operations**: All 9 operations are fully key-dependent — rotations use 1-7 bits determined by the key pixel, the S-box is derived per-image from the cipher key, and cross-channel operations use the full key byte
    - **Per-Image S-box**: The substitution table is derived deterministically from the cipher key via seeded Fisher-Yates shuffle, eliminating the v0.4 session-dependent global S-box
    - **Steganographic Embedding**: The key image is shuffled using the cipher key and embedded in the scrambled image for recovery
@@ -23,6 +25,15 @@ AIPosematic employs a multi-layered approach to protect digital images:
    - **Human-Visible**: The protection is intentionally visible to establish clear provenance
    - **AI-Disruptive**: The transformations are designed to confuse and degrade the performance of AI models
    - **Reversible**: Original image can be recovered with the proper cipher key and operation string
+
+## v1.1 Improvements Over v1.0
+
+| Issue | v1.0 | v1.1 |
+|:------|:-----|:-----|
+| **Flat opacity gradient** | All ops produce ~19.8% CLIP — op_string "dial" has no effect on disruption level | Per-op intensity: `>`,`<` (mild), `a`,`A` (medium), `p`,`P` (strong), `+`,`-`,`^` (full) |
+| **Manual cipher key** | Separate random hex string artists must manage | Derive from Stellar25519 keypair; ECDH for subscriber key agreement |
+| **Rotation intensity** | Always 1-7 bit rotation | Scaled `max_shift` based on op intensity (e.g., 1-2 bits for mild) |
+| **Cross-channel intensity** | Full channel sum always applied | Channel sum scaled by intensity factor |
 
 ## v1.0 Security Improvements Over v0.4
 
@@ -115,6 +126,51 @@ recovered_path = recover_aposematic_img(
 print(f"Recovered image: {recovered_path}")
 ```
 
+### Stellar Key Integration (v1.1)
+
+```python
+from hvym_stellar import Stellar25519KeyPair
+from aiposematic import new_aposematic_img, recover_aposematic_img
+
+# Artist creates a keypair (or loads existing)
+from stellar_sdk import Keypair
+artist_kp = Stellar25519KeyPair(Keypair.random())
+
+# Protect using Stellar-derived key (no manual hex key needed)
+result = new_aposematic_img("original.png", stellar_keypair=artist_kp)
+
+# Recover using same keypair
+recovered = recover_aposematic_img(result['img_path'], stellar_keypair=artist_kp)
+```
+
+### ECDH Subscriber Key Agreement (v1.1)
+
+```python
+from hvym_stellar import Stellar25519KeyPair
+from aiposematic import scramble, recover
+
+from stellar_sdk import Keypair
+artist_kp = Stellar25519KeyPair(Keypair.random())
+subscriber_kp = Stellar25519KeyPair(Keypair.random())
+
+# Artist scrambles for a specific subscriber
+result = scramble(
+    "original.png",
+    op_string="-^+",
+    stellar_keypair=artist_kp,
+    subscriber_public_key=subscriber_kp.public_key(),
+)
+
+# Subscriber recovers using their keypair + artist's public key
+recovered = recover(
+    result['scrambled_path'],
+    key_img_path=result['key_path'],
+    op_string="-^+",
+    stellar_keypair=subscriber_kp,
+    artist_public_key=artist_kp.public_key(),
+)
+```
+
 ### Low-Level API
 
 ```python
@@ -136,21 +192,21 @@ recovered = recover(
 
 ## Operations
 
-All 9 operations are key-dependent in v1.0:
+All 9 operations are key-dependent. Each has an intrinsic intensity (v1.1) that controls disruption level:
 
-| Op | Name | Description |
-|:---|:-----|:------------|
-| `+` | Add | `(pixel + key) mod 256` per channel |
-| `-` | Subtract | `(pixel - key) mod 256` per channel |
-| `^` | XOR | `pixel XOR key` per channel |
-| `>` | Rotate Right | Rotate right by `(key % 7) + 1` bits per channel |
-| `<` | Rotate Left | Rotate left by `(key % 7) + 1` bits per channel |
-| `p` | S-box | `SBOX[pixel XOR key]` — per-image S-box derived from cipher key |
-| `P` | Inverse S-box | `SBOX_INV[pixel] XOR key` |
-| `a` | Channel Add | `(pixel + sum(key_r, key_g, key_b)) mod 256` — cross-channel |
-| `A` | Channel Sub | `(pixel - sum(key_r, key_g, key_b)) mod 256` — cross-channel |
+| Op | Name | Intensity | Description |
+|:---|:-----|:----------|:------------|
+| `+` | Add | 1.0 (Strong) | `(pixel + key) mod 256` per channel |
+| `-` | Subtract | 1.0 (Strong) | `(pixel - key) mod 256` per channel |
+| `^` | XOR | 1.0 (Strong) | `pixel XOR key` per channel |
+| `>` | Rotate Right | 0.15 (Mild) | Rotate right by `(key % max_shift) + 1` bits (1-2 bits) |
+| `<` | Rotate Left | 0.15 (Mild) | Rotate left by `(key % max_shift) + 1` bits (1-2 bits) |
+| `p` | S-box | 0.70 (Medium) | `SBOX[pixel XOR scaled_key]` — per-image S-box derived from cipher key |
+| `P` | Inverse S-box | 0.70 (Medium) | `SBOX_INV[pixel] XOR scaled_key` |
+| `a` | Channel Add | 0.25 (Mild-Med) | `(pixel + scaled_sum(key_r, key_g, key_b)) mod 256` — cross-channel |
+| `A` | Channel Sub | 0.25 (Mild-Med) | `(pixel - scaled_sum(key_r, key_g, key_b)) mod 256` — cross-channel |
 
-Operations are applied via partitioning: each pixel receives one operation from the op_string cycle (`pixel_i` gets `op_string[i % len(op_string)]`). Since all operations are key-dependent, every pixel is protected regardless of which operation it receives.
+Operations are applied via partitioning: each pixel receives one operation from the op_string cycle (`pixel_i` gets `op_string[i % len(op_string)]`). The op_string composition now controls the overall disruption gradient — use mild ops (`>`, `<`, `a`) for subtle warnings and strong ops (`+`, `-`, `^`) for maximum disruption.
 
 ## Key Features
 

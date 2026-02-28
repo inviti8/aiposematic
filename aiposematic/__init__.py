@@ -1,6 +1,6 @@
 """Aiposematic: Scramble & Recover using image key + operation string , By: Fibo Metavinci"""
 
-__version__ = "1.0"
+__version__ = "1.1"
 import os
 import numpy as np
 import cv2
@@ -20,6 +20,12 @@ import secrets
 import hashlib
 import hmac
 from math import ceil
+
+try:
+    from hvym_stellar import Stellar25519KeyPair, StellarSharedKey
+    _HAS_STELLAR = True
+except ImportError:
+    _HAS_STELLAR = False
 
 class SCRAMBLE_MODE(Enum):
     """Available modes for key generation in the scrambling process."""
@@ -512,10 +518,11 @@ def _generate_qr_key(width=256, height=None, data="aposematic qr key", canvas_si
     return output_path
 
 
-def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None):
+def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=SCRAMBLE_MODE.NONE, output_path=None,
+             stellar_keypair=None, subscriber_public_key=None):
     """
     Scramble original using butterfly/QR key image for pixel ops (aposematic visual)
-    with v1.0 key-dependent operations and per-image S-box.
+    with v1.1 key-dependent operations, per-op intensity, and per-image S-box.
 
     The butterfly/QR image IS the cryptographic key for pixel operations, preserving
     the aposematic visual quality. The cipher_key is used to derive the S-box and
@@ -524,10 +531,12 @@ def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=
     Args:
         original_img_path: Path to image to scramble
         cipher_key: 128-bit hex string for S-box derivation and key shuffling.
-                    If None, generates a new one.
+                    If None, derived from stellar_keypair or generated randomly.
         op_string: Operation characters (partitioning model)
         scramble_mode: Key generation mode (BUTTERFLY or QR)
         output_path: Output path for scrambled image
+        stellar_keypair: Optional Stellar25519KeyPair for key derivation
+        subscriber_public_key: Optional subscriber public key for ECDH derivation
 
     Returns:
         dict: {'scrambled_path': str, 'cipher_key': str, 'key_path': str}
@@ -538,9 +547,14 @@ def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=
 
     h, w, c = img.shape
 
-    # Generate cipher_key if not provided
+    # Resolve cipher_key
     if cipher_key is None:
-        cipher_key = secrets.token_hex(16)
+        if stellar_keypair is not None and subscriber_public_key is not None:
+            cipher_key = derive_subscriber_cipher_key(stellar_keypair, subscriber_public_key)
+        elif stellar_keypair is not None:
+            cipher_key = derive_cipher_key(stellar_keypair)
+        else:
+            cipher_key = secrets.token_hex(16)
 
     # Generate visual key image (this IS the crypto key for pixel ops)
     if scramble_mode == SCRAMBLE_MODE.NONE:
@@ -588,20 +602,32 @@ def scramble(original_img_path, cipher_key=None, op_string="-^+", scramble_mode=
         'key_path': key_path
     }
 
-def recover(locked_img_path, key_img_path, cipher_key, op_string="-^+", output_path=None):
+def recover(locked_img_path, key_img_path, cipher_key=None, op_string="-^+", output_path=None,
+            stellar_keypair=None, artist_public_key=None):
     """
-    Recover original using key image + v1.0 key-dependent inverse operations.
+    Recover original using key image + v1.1 key-dependent inverse operations.
 
     Args:
         locked_img_path: Path to scrambled image
         key_img_path: Path to the key image used during scrambling
-        cipher_key: The cipher_key used for S-box derivation
+        cipher_key: The cipher_key used for S-box derivation.
+                    If None, derived from stellar_keypair.
         op_string: Same op_string used during scrambling
         output_path: Output path for recovered image
+        stellar_keypair: Optional Stellar25519KeyPair for key derivation
+        artist_public_key: Optional artist public key for ECDH derivation
 
     Returns:
         str: Path to recovered image
     """
+    # Resolve cipher_key
+    if cipher_key is None:
+        if stellar_keypair is not None and artist_public_key is not None:
+            cipher_key = derive_subscriber_cipher_key(stellar_keypair, artist_public_key)
+        elif stellar_keypair is not None:
+            cipher_key = derive_cipher_key(stellar_keypair)
+        else:
+            raise ValueError("cipher_key is required for recovery (provide cipher_key, stellar_keypair, or both stellar_keypair + artist_public_key)")
     locked = cv2.imread(locked_img_path)
     if locked is None:
         raise ValueError(f"Could not load locked image: {locked_img_path}")
@@ -708,19 +734,58 @@ def _derive_diffusion_init(cipher_key):
         hashlib.sha256
     ).hexdigest()[:2], 16)
 
-def _key_rotate_right(a, b):
-    """Rotate each byte right by (key_byte % 7) + 1 bits (1-7)."""
-    shift = (b % 7) + 1
+def derive_cipher_key(stellar_keypair):
+    """Derive a cipher_key from a Stellar25519KeyPair.
+
+    Args:
+        stellar_keypair: A Stellar25519KeyPair instance.
+
+    Returns:
+        str: 32-char hex string suitable for use as cipher_key.
+    """
+    if not _HAS_STELLAR:
+        raise ImportError("hvym-stellar is required for Stellar key derivation")
+    raw = stellar_keypair.base_stellar_keypair().raw_secret_key() + b":aiposematic:sbox"
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def derive_subscriber_cipher_key(artist_keypair, subscriber_public_key):
+    """Derive a shared cipher_key via ECDH between artist and subscriber.
+
+    Args:
+        artist_keypair: The artist's Stellar25519KeyPair.
+        subscriber_public_key: The subscriber's public key (base64 URL-safe string).
+
+    Returns:
+        str: 32-char hex string suitable for use as cipher_key.
+    """
+    if not _HAS_STELLAR:
+        raise ImportError("hvym-stellar is required for Stellar key derivation")
+    shared = StellarSharedKey(artist_keypair, subscriber_public_key)
+    raw = shared.shared_secret() + b":aiposematic:sbox"
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def _key_rotate_right(a, b, max_shift=7):
+    """Rotate each byte right by (key_byte % max_shift) + 1 bits."""
+    shift = (b % max_shift) + 1
     return ((a >> shift) | (a << (8 - shift))) & 0xFF
 
-def _key_rotate_left(a, b):
-    """Rotate each byte left by (key_byte % 7) + 1 bits (1-7)."""
-    shift = (b % 7) + 1
+def _key_rotate_left(a, b, max_shift=7):
+    """Rotate each byte left by (key_byte % max_shift) + 1 bits."""
+    shift = (b % max_shift) + 1
     return ((a << shift) | (a >> (8 - shift))) & 0xFF
 
 # ------------------------------------------------------------------
 # v1.0 Operations (all key-dependent) + Composition
 # ------------------------------------------------------------------
+
+OP_INTENSITY = {
+    '+': 1.0, '-': 1.0, '^': 1.0,   # Strong
+    '>': 0.15, '<': 0.15,             # Mild (1-2 bit rotation)
+    'p': 0.70, 'P': 0.70,             # Medium-strong
+    'a': 0.25, 'A': 0.25,             # Mild-medium (0-63 range)
+}
 
 V1_OPS = {
     '+': lambda a, b, s, si: (a + b) % 256,
@@ -750,7 +815,8 @@ def _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=False):
     """Apply operations via partitioning: pixel_i gets op_string[i % L].
 
     Each pixel receives one operation from the op_string cycle. All operations
-    are key-dependent (v1.0 improvement over v0.4).
+    are key-dependent. Per-op intensity scaling (v1.1) restores the aposematic
+    gradient so that the op_string "dial" controls disruption level.
 
     Args:
         pixels:     (N, 3) uint8 — source pixel values
@@ -769,16 +835,38 @@ def _apply_ops_v1(pixels, key_pixels, op_string, sbox, inv_sbox, inverse=False):
 
     op_indices = np.arange(n) % op_len
 
-    for i, op_char in enumerate(op_string):
+    for i, orig_op_char in enumerate(op_string):
+        intensity = OP_INTENSITY[orig_op_char]
+
         if inverse:
-            op_char = V1_INV_OPS[op_char]
+            op_char = V1_INV_OPS[orig_op_char]
+        else:
+            op_char = orig_op_char
 
         mask = op_indices == i
         a = pixels[mask].astype(np.int32)
-        b = key_pixels[mask].astype(np.int32)
+        b_raw = key_pixels[mask].astype(np.int32)
 
-        op_fn = V1_OPS[op_char]
-        result[mask] = np.asarray(op_fn(a, b, sbox, inv_sbox))
+        if orig_op_char in ('>', '<'):
+            # Rotation ops: scale max_shift by intensity
+            ms = max(2, round(7 * intensity))
+            if op_char == '>':
+                result[mask] = _key_rotate_right(a, b_raw, max_shift=ms)
+            else:
+                result[mask] = _key_rotate_left(a, b_raw, max_shift=ms)
+        elif orig_op_char in ('a', 'A'):
+            # Cross-channel ops: scale the channel sum by intensity
+            chan_sum = (b_raw[:, 0] + b_raw[:, 1] + b_raw[:, 2]) % 256
+            scaled_sum = np.round(chan_sum * intensity).astype(np.int32)
+            if op_char == 'a':
+                result[mask] = (a + scaled_sum.reshape(-1, 1)) % 256
+            else:
+                result[mask] = (a - scaled_sum.reshape(-1, 1)) % 256
+        else:
+            # +, -, ^, p, P: scale key bytes by intensity
+            b = np.round(b_raw * intensity).astype(np.int32)
+            op_fn = V1_OPS[op_char]
+            result[mask] = np.asarray(op_fn(a, b, sbox, inv_sbox))
 
     return result.astype(np.uint8)
 
@@ -951,15 +1039,25 @@ def add_ai_deterrent_features(image_path, output_path):
     cv2.imwrite(output_path, img)
     return output_path
 
-def new_aposematic_img(original_img_path, cipher_key=None, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None):
+def new_aposematic_img(original_img_path, cipher_key=None, op_string='-^+', scramble_mode=SCRAMBLE_MODE.BUTTERFLY, output_path=None,
+                       stellar_keypair=None, subscriber_public_key=None):
     """
     Create a new aposematic image.
 
     Pipeline:
       1. Apply AI deterrent features
-      2. Scramble with butterfly/QR key image + v1.0 key-dependent ops
+      2. Scramble with butterfly/QR key image + v1.1 key-dependent ops
       3. Shuffle key image using cipher_key as seed
       4. Embed shuffled key via steganography
+
+    Args:
+        original_img_path: Path to the original image
+        cipher_key: Optional cipher key. If None, derived from stellar_keypair or generated randomly.
+        op_string: Operation characters (partitioning model)
+        scramble_mode: Key generation mode (BUTTERFLY or QR)
+        output_path: Output path for the aposematic image
+        stellar_keypair: Optional Stellar25519KeyPair for key derivation
+        subscriber_public_key: Optional subscriber public key for ECDH derivation
 
     Returns:
         dict: {'img_path': str, 'cipher_key': str}
@@ -967,8 +1065,14 @@ def new_aposematic_img(original_img_path, cipher_key=None, op_string='-^+', scra
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
         temp_path = temp_file.name
 
+    # Resolve cipher_key
     if cipher_key is None:
-        cipher_key = secrets.token_hex(16)
+        if stellar_keypair is not None and subscriber_public_key is not None:
+            cipher_key = derive_subscriber_cipher_key(stellar_keypair, subscriber_public_key)
+        elif stellar_keypair is not None:
+            cipher_key = derive_cipher_key(stellar_keypair)
+        else:
+            cipher_key = secrets.token_hex(16)
 
     try:
         # Step 1: Apply AI deterrent features
@@ -1009,15 +1113,33 @@ def new_aposematic_img(original_img_path, cipher_key=None, op_string='-^+', scra
         'cipher_key': cipher_key
     }
 
-def recover_aposematic_img(aposematic_img_path, cipher_key, op_string='-^+', output_path=None):
+def recover_aposematic_img(aposematic_img_path, cipher_key=None, op_string='-^+', output_path=None,
+                           stellar_keypair=None, artist_public_key=None):
     """
     Recover the original image from an aposematic image.
 
     Pipeline:
       1. Extract shuffled key image from steganographic payload
       2. Unshuffle key image using cipher_key
-      3. Recover with key image + v1.0 inverse ops
+      3. Recover with key image + v1.1 inverse ops
+
+    Args:
+        aposematic_img_path: Path to the aposematic image
+        cipher_key: The cipher_key used during scrambling.
+                    If None, derived from stellar_keypair.
+        op_string: Same op_string used during scrambling
+        output_path: Output path for recovered image
+        stellar_keypair: Optional Stellar25519KeyPair for key derivation
+        artist_public_key: Optional artist public key for ECDH derivation
     """
+    # Resolve cipher_key
+    if cipher_key is None:
+        if stellar_keypair is not None and artist_public_key is not None:
+            cipher_key = derive_subscriber_cipher_key(stellar_keypair, artist_public_key)
+        elif stellar_keypair is not None:
+            cipher_key = derive_cipher_key(stellar_keypair)
+        else:
+            raise ValueError("cipher_key is required for recovery (provide cipher_key, stellar_keypair, or both stellar_keypair + artist_public_key)")
     try:
         # Step 1: Extract the shuffled key image
         shuffled_key_path = _steganography_decode(aposematic_img_path)

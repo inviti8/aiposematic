@@ -79,3 +79,5 @@ analysis_results/scrambled_qr/pixel_distribution.png
 .claude/
 
 aiposematic/__pycache__/
+
+__pycache__

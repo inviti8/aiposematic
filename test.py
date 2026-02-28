@@ -7,8 +7,17 @@ from aiposematic import (
     scramble,
     recover,
     new_aposematic_img,
-    recover_aposematic_img
+    recover_aposematic_img,
+    derive_cipher_key,
+    OP_INTENSITY,
 )
+
+try:
+    from hvym_stellar import Stellar25519KeyPair
+    from stellar_sdk import Keypair as StellarKeypair
+    _HAS_STELLAR = True
+except ImportError:
+    _HAS_STELLAR = False
 
 def display_image(title, image_path, display_time=4000):
     """Display an image using OpenCV."""
@@ -175,6 +184,80 @@ def test_wrong_key_v1(input_image):
         except:
             pass
 
+def test_intensity_variation(input_image):
+    """Demonstrate that different op_strings produce different disruption levels."""
+    print("\n" + "="*50)
+    print("Testing v1.1: Per-Op Intensity Variation")
+    print("="*50)
+
+    op_strings = [">", "a", "p", "-^+", "-^+p>a<PA"]
+    for op_str in op_strings:
+        result = scramble(
+            original_img_path=input_image,
+            op_string=op_str,
+        )
+        scrambled = cv2.imread(result['scrambled_path'])
+        original = cv2.imread(input_image)
+        diff = np.abs(scrambled.astype(float) - original.astype(float)).mean()
+        print(f"  op_string='{op_str}' -> mean pixel diff = {diff:.2f}")
+
+        # Verify roundtrip
+        recovered = recover(
+            result['scrambled_path'],
+            key_img_path=result['key_path'],
+            cipher_key=result['cipher_key'],
+            op_string=op_str,
+        )
+        rec_img = cv2.imread(recovered)
+        assert np.array_equal(original, rec_img), f"Roundtrip failed for op_string='{op_str}'"
+
+        for p in [result['scrambled_path'], result['key_path'], recovered]:
+            if os.path.exists(p):
+                os.unlink(p)
+
+    print("PASS: All intensity roundtrips pixel-perfect!")
+
+
+def test_stellar_workflow(input_image):
+    """Test scramble/recover using Stellar keypair for key derivation."""
+    if not _HAS_STELLAR:
+        print("\n" + "="*50)
+        print("SKIP: Stellar workflow test (hvym-stellar not installed)")
+        print("="*50)
+        return
+
+    print("\n" + "="*50)
+    print("Testing v1.1: Stellar Key Integration")
+    print("="*50)
+
+    kp = Stellar25519KeyPair(StellarKeypair.random())
+    print(f"  Public key: {kp.public_key()[:16]}...")
+
+    # Scramble using Stellar keypair
+    result = new_aposematic_img(
+        original_img_path=input_image,
+        op_string="-^+",
+        stellar_keypair=kp,
+    )
+    print(f"  Derived cipher_key: {result['cipher_key']}")
+    display_image("Stellar Aposematic", result['img_path'])
+
+    # Recover using same Stellar keypair
+    recovered = recover_aposematic_img(
+        aposematic_img_path=result['img_path'],
+        op_string="-^+",
+        stellar_keypair=kp,
+    )
+    display_image("Stellar Recovered", recovered)
+
+    # Clean up
+    for p in [result['img_path'], recovered]:
+        if os.path.exists(p):
+            os.unlink(p)
+
+    print("PASS: Stellar self-recovery workflow!")
+
+
 def main():
     input_image = "original.png"
 
@@ -206,6 +289,12 @@ def main():
 
     # v1.0 wrong key test
     test_wrong_key_v1(input_image)
+
+    # v1.1 intensity variation test
+    test_intensity_variation(input_image)
+
+    # v1.1 Stellar integration test
+    test_stellar_workflow(input_image)
 
     print("\nAll tests completed!")
 
